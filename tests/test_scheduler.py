@@ -830,3 +830,36 @@ async def test_review_tier_measures_this_plans_change_from_plan_base(repo):
     s2, store2, g2, _, _, _ = await run(repo, _review_plan(), worker=w, integration_gates=["true"])
     assert seen["r"][:2] == ("opus", "high")                        # MACC_BASE would include the earlier plan
     assert "new public symbols" in seen["r"][2] or "source lines changed" in seen["r"][2]
+
+
+def _noop_integrate_worker():
+    """MockWorker, except the integrate task returns without changing anything."""
+    from macc.workers import WorkerResult
+    worker, seen = MockWorker(), {}
+    orig = worker.__call__
+
+    async def w(task, wt, pack):
+        seen[task.id] = (task.model, task.effort, pack)
+        if task.kind == "integrate":
+            return WorkerResult(ok=True, fields={"open_questions": "", "notes_for_downstream": "nothing to do",
+                                                 "stubs": []}, model="mock")
+        return await orig(task, wt, pack)
+    w.name = "mock"
+    return w, seen
+
+
+async def test_noop_integrate_still_proves_the_tree_green_for_the_review(repo):
+    w, seen = _noop_integrate_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["true"],
+                                                skip_noop_integrate=False)
+    assert summary["finished"] and "i" in seen                      # integrate really ran (skip disabled)
+    full = [e for e in store.events(limit=500) if e["type"] == "full_gate"]
+    assert full and full[0]["task_id"] == "i"                        # proved green although nothing merged
+    assert seen["r"][:2] == ("sonnet", "medium")                     # so the review can be tiered low
+
+
+async def test_noop_integrate_fails_when_the_full_gate_fails(repo):
+    w, seen = _noop_integrate_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["false"],
+                                                skip_noop_integrate=False)
+    assert g.tasks["i"].state in (State.FAILED.value, State.PENDING.value) and "r" not in seen

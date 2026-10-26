@@ -105,6 +105,10 @@ Rules for commands in `done_when` / `integration_gates`:
 - A task that replaces or extends an existing file must say so explicitly in its spec, name the file,
   and own it. Do not assume an empty repository.
 - If a check must verify "stdlib only", test against `sys.stdlib_module_names`, never a hand-written list.
+- Do not assert "nothing changed under X since $MACC_BASE" for paths an upstream task (a dep) writes: once
+  that task merges, the check can never pass. A task's own scope is already enforced by its `owns` (only
+  owned paths are committed); guard with `git diff --quiet $MACC_BASE -- <paths>` only for paths that no
+  task in the plan owns.
 
 # Measured history in this repo (worker time per run, from macc's usage table)
 {HISTORY}
@@ -182,6 +186,28 @@ def _glob_hit(path: str, glob: str) -> bool:
     return bool(d) and (path == d or path.startswith(d + "/"))
 
 
+# `git diff --quiet $MACC_BASE -- p1 p2 ...` (quotes/braces around the variable allowed)
+_UNCHANGED_GUARD = re.compile(r"git\s+diff\s+(?:--\S+\s+)*[\"']?\$\{?MACC_BASE\}?[\"']?\s+(?:--\S+\s+)*--\s+([^&|;]+)")
+
+
+def impossible_guards(g: TaskGraph) -> list[str]:
+    """done_when checks that some path is unchanged since $MACC_BASE while an ancestor task owns it."""
+    from .graph import _paths_overlap
+    out = []
+    for t in g.tasks.values():
+        for cmd in t.done_when:
+            for m in _UNCHANGED_GUARD.finditer(cmd):
+                paths = [x.strip("'\"") for x in m.group(1).split() if not x.startswith(":(")]
+                for a in sorted(g.ancestors(t.id)):
+                    # a bare path in `git diff -- p` covers the file p and everything under directory p
+                    hit = [p for p in paths for o in g.tasks[a].owns
+                           if _paths_overlap(p.rstrip("/"), o) or _paths_overlap(p.rstrip("/") + "/**", o)]
+                    if hit:
+                        out.append(f"{t.id}: done_when asserts {sorted(set(hit))} unchanged since $MACC_BASE, but "
+                                   f"upstream task {a} owns them; the check fails once {a} merges")
+    return out
+
+
 CONTRACT_MAX_MINUTES = 8
 # a contract that pre-computes answers becomes a long serial node (AutoLeaseRank /insights: 22 min of 28)
 _EXPECTED = re.compile(r"\bexpected\s+(?:outputs?|values?|results?|answers?|numbers?)\b"
@@ -229,6 +255,9 @@ def validate_plan(data: dict) -> TaskGraph:
         if bad:
             raise PlanError(f"contract {t.id}: spec asks for expected values ({bad!r}); the contract's test "
                             "plan says what to test, the test tasks compute expected values")
+    bad_guards = impossible_guards(g)
+    if bad_guards:
+        raise PlanError("; ".join(bad_guards))
     code_without_gates = [t.id for t in g.tasks.values() if t.kind == Kind.CODE.value and not t.done_when]
     if code_without_gates:
         raise PlanError(f"code tasks without done_when: {code_without_gates}")

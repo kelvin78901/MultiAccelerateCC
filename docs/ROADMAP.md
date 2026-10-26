@@ -174,7 +174,27 @@ Applied retroactively to the four runs:
 | refactor | 222 | 4 | low | 188 s / $1.35, 128-request differential probe, no findings |
 
 Opus stays where it found things; the two low-risk reviews ($2.08 of the $4.30 spent on reviews) move to
-sonnet. Not yet measured live: whether a sonnet review on a low-tier change misses anything.
+sonnet.
+
+**First live A/B (AutoLeaseRank `add_flat_routes` fix, 31 source lines, 0 new public API).** The live run
+rated the review *high* only because a no-op integrate left no full-gate result (fixed in v0.3.1), so
+the live review was opus/high; the same context pack and commit were then reviewed by sonnet/medium:
+
+| reviewer | time | cost | output tokens | report | verdict |
+|---|---|---|---|---|---|
+| opus / high (live) | 144 s | $1.06 | 15.9k | 106 lines | APPROVE |
+| sonnet / medium (A/B) | 117 s | $0.36 | 8.3k | 35 lines | REJECT: `test_openapi_equals_include_router` is flaky |
+
+The sonnet verdict was right: unseeded, the full suite fails 2 of 25 runs (the multi-method test
+route's default operationId follows `methods` set order, which depends on the hash seed). Opus ran the
+suite once, saw it pass, and noted the `Duplicate Operation ID` warning as benign; every macc gate also
+passed by luck. One sample, so no general claim, but it is evidence that the cheaper tier is not
+weaker at finding defects when it actually runs the code, and that single-run gates do not catch
+flakiness (candidate: run newly added test files several times with random seeds at integrate).
+
+v0.3.1 fixes found by this run: a `done_when` asserting paths unchanged since `$MACC_BASE` while an
+upstream task owns them is rejected by `validate_plan` (it could never pass; it cost 2 attempts); an
+integrate that changes nothing now runs the full gate itself, so the review after it can be tiered.
 
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus

@@ -128,3 +128,19 @@ def test_planner_prompt_has_slim_contract_and_fixture_rules():
     assert "never the expected values" in PLANNER_PROMPT and "at most 8" in PLANNER_PROMPT
     assert "Fixture data shared by several test tasks is its own `kind: code` task" in PLANNER_PROMPT
     assert "10 and 60 estimated minutes" not in PLANNER_PROMPT
+
+
+def test_impossible_unchanged_guard_is_rejected():
+    from macc.planner import impossible_guards
+    base = yaml.safe_load(MOCK_PLAN)
+    # backend depends on contract, which owns api/**: "api unchanged since base" can never pass for backend
+    base["tasks"][1]["done_when"] = ['git diff --quiet "$MACC_BASE" -- api server/legacy && test -f server/x']
+    with pytest.raises(PlanError, match=r"backend: done_when asserts \['api'\] unchanged since \$MACC_BASE"):
+        validate_plan(base)
+    ok = yaml.safe_load(MOCK_PLAN)
+    # paths nobody in the plan owns (vendored code, lockfiles) are a legitimate guard
+    ok["tasks"][1]["done_when"] = ["git diff --quiet $MACC_BASE -- vendor requirements.txt"]
+    assert impossible_guards(validate_plan(ok)) == []
+    # a guard on a path only a *downstream* task owns is fine at this task's time
+    ok["tasks"][0]["done_when"] = ["test -f api/openapi.yaml", "git diff --quiet ${MACC_BASE} -- server"]
+    validate_plan(ok)

@@ -482,6 +482,21 @@ class Scheduler:
             self.merged_this_run.append(tid)
             self._merged_since_full_gate = not (full and cmds)
 
+        elif t.kind == Kind.INTEGRATE.value and self.cfg.integration_gates:
+            # an integrate that changed nothing still has to prove the tree is green: otherwise the review
+            # after it sees no full-gate result for its tree (and cannot be tiered low)
+            head = self.repo.head(self.repo.integration_path)
+            last = self.store.latest_event("full_gate")
+            if not (last and last["payload"].get("ok") and last["payload"].get("head") == head):
+                fgates = self.repo.run_gates(self.cfg.integration_gates)
+                self._record_gates(tid, fgates, full=True)
+                bad = next((g for g in fgates if not g["ok"]), None)
+                if bad:
+                    self._fail(t, f"integrate changed nothing but the full gate fails: {bad['cmd']}\n"
+                                  f"{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
+                    self._cleanup(tid)
+                    return
+                self._merged_since_full_gate = False
         # 6. done + staleness propagation
         self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
         t.last_error = None

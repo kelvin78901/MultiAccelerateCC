@@ -37,6 +37,8 @@ class WorkerResult:
 
 WorkerFn = Callable[[Task, Path, str], Awaitable[WorkerResult]]
 
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
 
 class ClaudeWorker:
     """Headless Claude Code. The context pack is the prompt; CLAUDE.md in the worktree still applies."""
@@ -81,16 +83,25 @@ class ClaudeWorker:
                        "Bash(ls:*)", "Bash(find:*)"]
             # reviewers must be able to RUN the gates, not just read the code
             for cmd_line in list(task.done_when) + list(self.gate_commands):
-                head = cmd_line.strip().split()
-                if head:
-                    base = os.path.basename(head[0])
-                    if base.startswith("python") and len(head) > 2 and head[1] == "-m":
-                        prefix = " ".join(head[:3])          # python -m pytest  (also /abs/venv/bin/python -m pytest)
-                    elif base in ("bash", "sh", "make", "npm", "npx", "uv", "cargo", "go", "gradlew"):
-                        prefix = " ".join(head[:2])          # bash script.sh / npm test / make check
-                    else:
-                        prefix = head[0]                     # ruff / pytest / tsc
+                words = cmd_line.strip().split()
+                env = []                                     # leading VAR=value assignments (PYTHONPATH=. ...)
+                while words and _ENV_ASSIGN.match(words[0]):
+                    env.append(words.pop(0))
+                if not words:
+                    continue
+                base = os.path.basename(words[0])
+                if base.startswith("python"):
+                    # reviewers run the gate and their own probes (`python -c`, a differential app):
+                    # allow the project interpreter itself. Commits are scoped to the review's own report.
+                    prefixes = [words[0]]
+                elif base in ("bash", "sh", "make", "npm", "npx", "uv", "cargo", "go", "gradlew"):
+                    prefixes = [" ".join(words[:2])]          # bash script.sh / npm test / make check
+                else:
+                    prefixes = [words[0]]                     # ruff / pytest / tsc / test / grep
+                for prefix in prefixes:
                     allowed.append(f"Bash({prefix}:*)")
+                    if env:
+                        allowed.append(f"Bash({' '.join(env)} {prefix}:*)")
             cmd += ["--allowedTools", ",".join(dict.fromkeys(allowed))]
         else:
             # headless mode denies anything not pre-allowed; workers need the full kit.
@@ -233,6 +244,8 @@ class MockWorker:
         target.parent.mkdir(parents=True, exist_ok=True)
         stub = "mock:stub" in task.spec
         body = f"# {task.id} attempt {task.attempts}\n" + ("# TODO(macc) stubbed\n" if stub else "")
+        if task.kind == "review":            # a real reviewer never rewrites its report byte for byte
+            body += f"# review call {len(self.calls)}\n"
         target.write_text(body)
         verdict = ""
         if task.kind == "review":

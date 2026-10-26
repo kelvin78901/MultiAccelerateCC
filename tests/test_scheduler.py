@@ -880,3 +880,43 @@ async def test_revalidated_integrate_records_full_gate_so_review_can_be_tiered(r
     assert ("revalidated", "i") in events and "i" not in seen          # integrate not re-run...
     assert ("full_gate", "i") in events                                 # ...but proved the new tree green
     assert seen["r"][:2] == ("sonnet", "medium")
+
+
+async def test_rerun_review_must_rewrite_its_report(repo):
+    from macc.workers import WorkerResult
+    worker = MockWorker()
+    orig = worker.__call__
+    calls = {"r": 0}
+
+    async def w(task, wt, pack):
+        if task.kind == "review":
+            calls["r"] += 1
+            if calls["r"] == 2:                                          # round 2 writes nothing
+                return WorkerResult(ok=True, fields={"open_questions": "", "stubs": [],
+                                                     "notes_for_downstream": "VERDICT: APPROVE"}, model="mock")
+        return await orig(task, wt, pack)
+    w.name = "mock"
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(_review_plan()); g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"])
+    await Scheduler(repo, store, g, w, cfg).run()                         # round 1 writes docs/r.txt
+    g.update_spec("a", g.tasks["a"].spec + " (changed)")
+    events = []
+    await Scheduler(repo, store, g, w, cfg, on_event=lambda t, tid, p: events.append((t, tid, p))).run()
+    retry = next(p for t, tid, p in events if t == "retry" and tid == "r")
+    assert "write a fresh report" in retry["error"]
+    assert calls["r"] == 3 and g.tasks["r"].state == State.DONE.value     # round 3 wrote it
+
+
+async def test_skipped_integrate_in_a_change_round_still_runs_the_review(repo):
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(_review_plan()); g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"])
+    worker = MockWorker()
+    await Scheduler(repo, store, g, worker, cfg).run()
+    g.update_spec("a", g.tasks["a"].spec + " (changed)")                # integrate and review go stale
+    events = []
+    summary = await Scheduler(repo, store, g, worker, cfg,
+                              on_event=lambda t, tid, p: events.append((t, tid))).run()
+    assert ("integrate_skipped", "i") in events
+    assert ("dispatched", "r") in events and summary["finished"], (summary, events)

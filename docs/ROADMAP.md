@@ -192,9 +192,20 @@ passed by luck. One sample, so no general claim, but it is evidence that the che
 weaker at finding defects when it actually runs the code, and that single-run gates do not catch
 flakiness (candidate: run newly added test files several times with random seeds at integrate).
 
+Follow-up (same day): the flaky test was fixed through `macc change flat_routes_tests` (one line: an
+explicit `operation_id` on the multi-method test route; done_when now runs the file 10 times with a random
+hash seed). Unseeded full suite: 2/25 failures before, **0/25** after. That round's review was tiered low
+and ran on sonnet/medium: 39 s, $0.21.
+
 v0.3.1 fixes found by this run: a `done_when` asserting paths unchanged since `$MACC_BASE` while an
 upstream task owns them is rejected by `validate_plan` (it could never pass; it cost 2 attempts); an
 integrate that changes nothing now runs the full gate itself, so the review after it can be tiered.
+v0.3.2/0.3.3: a revalidated integrate also proves the full gate (else the review is tiered high again);
+after an integrate is skipped in a change round, stale dependents are re-examined (the review used to be
+left STALE and the run ended unfinished); reviewer tool allowlists skip leading `VAR=value` words and
+allow the project interpreter itself (a `PYTHONPATH=. …` gate produced `Bash(PYTHONPATH=.:*)`, so probes
+worked only by accident and one review could not run Python); a re-run review that commits nothing is
+retried with "write a fresh report" (the earlier round's file satisfied its done_when).
 
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus

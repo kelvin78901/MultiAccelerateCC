@@ -76,7 +76,7 @@ async def test_reviewer_may_run_gate_commands(tmp_path, monkeypatch):
     t = Task("r", "r", kind="review", done_when=["bash scripts/check.sh --all"])
     await w(t, wt, "p")
     args = args_file.read_text()
-    assert "Bash(python -m pytest:*)" in args and "Bash(ruff:*)" in args and "Bash(bash scripts/check.sh:*)" in args
+    assert "Bash(python:*)" in args and "Bash(ruff:*)" in args and "Bash(bash scripts/check.sh:*)" in args
     assert "Edit" not in args.split("--allowedTools")[1].split()[0]
 
 
@@ -112,3 +112,19 @@ async def test_claude_worker_exports_env_provider_vars(tmp_path):
     lines = (wt / "env.txt").read_text().splitlines()
     assert "MACC_BASE=abc1234" in lines and "MACC_INTEGRATION=def5678" in lines
     assert "MACC_TASK=t1" in lines and "MACC_OWNS=x/**" in lines   # task identity is not overridable
+
+
+async def test_reviewer_allowlist_handles_env_prefixed_gates(tmp_path, monkeypatch):
+    fake = make_fake(tmp_path)
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("FAKE_ARGS_FILE", str(args_file))
+    wt = tmp_path / "wt"; wt.mkdir()
+    w = ClaudeWorker(binary=str(fake))
+    w.gate_commands = ["PYTHONPATH=. /p/.venv/bin/python -m pytest -q tests"]
+    await w(Task("r", "r", kind="review", done_when=["FOO=1 BAR=2 make check"]), wt, "p")
+    allowed = args_file.read_text().split("--allowedTools ")[1].strip().split(",")
+    assert "Bash(/p/.venv/bin/python:*)" in allowed                    # the interpreter itself (probes)
+    assert "Bash(PYTHONPATH=. /p/.venv/bin/python:*)" in allowed       # and with the gate's env prefix
+    assert "Bash(make check:*)" in allowed and "Bash(FOO=1 BAR=2 make check:*)" in allowed
+    assert "Bash(PYTHONPATH=.:*)" not in allowed                       # the old accidental rule
+    assert not any(a.startswith(("Edit", "Write")) for a in allowed)

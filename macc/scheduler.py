@@ -187,10 +187,11 @@ class Scheduler:
         return True
 
     def _dispatch_ready(self) -> int:
-        # skipping an integrate makes its dependents ready at once: repeat until nothing more is skipped
+        # skipping an integrate makes its dependents ready at once (a STALE review must first go back to
+        # pending, or the run ends with it never dispatched): repeat until nothing more is skipped
         while any(self._try_skip_integrate(t) for t in self.graph.ready()
                   if t.kind == Kind.INTEGRATE.value and t.id not in self.running):
-            pass
+            self._revalidate_stale()
         n = 0
         now = time.time()
         for t in self.graph.ready():
@@ -365,6 +366,13 @@ class Scheduler:
                               "Only modify owned paths; describe other needs in open_questions.")
                 self._cleanup(tid)
                 return
+        if not committed and t.kind == Kind.REVIEW.value and t.owns and self.store.latest_handoff(tid):
+            # a re-run review that commits nothing leaves the previous round's report in place, and a
+            # done_when that greps it passes on that stale file
+            self._fail(t, "this review round committed nothing: write a fresh report for this round into "
+                          f"{t.owns} (the existing file is from an earlier round)")
+            self._cleanup(tid)
+            return
         if not committed and t.kind in (Kind.CODE.value, Kind.CONTRACT.value):
             self._fail(t, "worker produced no changes")
             self._cleanup(tid)

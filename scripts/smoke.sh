@@ -8,9 +8,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${1:-$HOME/macc-smoke}"
-MACC="$HERE/.venv/bin/macc"
+MACC="$HERE/.venv/bin/python -m macc.cli"
 # (re)create the venv if missing or built for another OS (e.g. inside a Linux sandbox)
-if ! "$HERE/.venv/bin/python" -c "import macc" >/dev/null 2>&1; then
+if ! "$HERE/.venv/bin/python" -c "import macc, sys; assert sys.prefix.startswith('$HERE')" >/dev/null 2>&1; then
   rm -rf "$HERE/.venv"
   python3 -m venv "$HERE/.venv"
   "$HERE/.venv/bin/pip" install -q -e "$HERE[dev]"
@@ -67,10 +67,10 @@ tasks:
       (import from calc.core). Do not implement calc/core.py yourself. Add an empty tests/__init__.py.
 EOF
 
-"$MACC" init
-"$MACC" plan plan.yaml
+$MACC init
+$MACC plan plan.yaml
 echo; echo ">>> running with real workers (claude -p, effort low)"; echo
-time "$MACC" run --worker claude --parallel 2 || true
-echo; "$MACC" status
+time $MACC run --worker claude --parallel 2 || true
+echo; $MACC status
 echo; echo "integration tree:"; git -C .macc/worktrees/_integration ls-files
-echo; echo "events:"; "$MACC" events --n 40
+echo; echo "events:"; $MACC events --n 40

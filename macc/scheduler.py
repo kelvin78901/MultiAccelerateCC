@@ -173,8 +173,7 @@ class Scheduler:
             self.emit("stub_without_permission", tid, stubs=stubs)
         if t.kind == Kind.REVIEW.value and "REJECT" in (res.fields.get("notes_for_downstream", "").upper()):
             self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
-            self._fail(t, "review rejected: " + res.fields.get("notes_for_downstream", "")[:1500], final=True)
-            self.emit("review_rejected", tid, reviewed=t.deps)
+            self._review_reject(t, res.fields.get("notes_for_downstream", ""))
             self._cleanup(tid)
             return
 
@@ -226,6 +225,26 @@ class Scheduler:
                 self.running[c].cancel()
                 self.emit("preempt_requested", c, because=tid)
         self._cleanup(tid)
+
+    def _review_reject(self, review: Task, notes: str) -> None:
+        """REJECT verdict: reopen the reviewed tasks with the notes as their error context.
+        Each rejection consumes one attempt of the review task, so review/fix loops are bounded."""
+        reviewed = [d for d in review.deps
+                    if self.graph.tasks[d].kind in (Kind.CODE.value, Kind.CONTRACT.value, Kind.INTEGRATE.value)]
+        if review.attempts >= review.max_attempts:
+            # last round: stop the fix loop, leave reviewed work merged, escalate to a human
+            self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts, final=True)
+            self._fail(review, "review rejected (final round, needs human): " + notes[:1500], final=True)
+            return
+        for d in reviewed:
+            u = self.graph.tasks[d]
+            u.state = State.PENDING.value
+            u.attempts = 0
+            u.last_error = f"review rejected (round {review.attempts}): {notes[:2500]}"
+        self.store.add_decision(f"Review round {review.attempts} rejected", notes[:2000], affects=reviewed)
+        self._persist(*reviewed)
+        self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts)
+        self._fail(review, "review rejected: " + notes[:1500])   # PENDING until max_attempts, then FAILED
 
     def _fail(self, t: Task, error: str, final: bool = False) -> None:
         t.last_error = error

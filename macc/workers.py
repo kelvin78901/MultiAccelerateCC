@@ -171,7 +171,10 @@ class MockWorker:
         stub = "mock:stub" in task.spec
         body = f"# {task.id} attempt {task.attempts}\n" + ("# TODO(macc) stubbed\n" if stub else "")
         target.write_text(body)
-        fields = {"open_questions": "", "notes_for_downstream": f"{task.id} wrote {path}",
+        verdict = ""
+        if task.kind == "review":
+            verdict = "REJECT: needs tests" if ("mock:reject_first" in task.spec and task.attempts <= 1) else "APPROVE"
+        fields = {"open_questions": "", "notes_for_downstream": verdict or f"{task.id} wrote {path}",
                   "stubs": [f"{path}: stubbed by mock"] if stub else []}
         text = f"done\n{HANDOFF_BEGIN}\n{json.dumps(fields)}\n{HANDOFF_END}"
         return WorkerResult(ok=True, output_text=text, fields=parse_worker_output(text), model="mock",

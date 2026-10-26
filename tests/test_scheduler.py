@@ -216,3 +216,44 @@ async def test_broken_baseline_gate_blocks_without_charging_attempt(repo):
     assert worker.calls == ["t"]                      # exactly one worker run, no retry loop
     assert not (repo.integration_path / "x" / "t.txt").exists()
     assert "baseline" in t.last_error
+
+
+async def test_review_reject_reopens_reviewed_tasks(repo):
+    tasks = [
+        Task("impl", "impl", owns=["x/**"]),
+        Task("review", "review", kind=Kind.REVIEW.value, deps=["impl"], owns=["docs/review/**"],
+             spec="mock:reject_first", max_attempts=2),
+    ]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    assert summary["finished"], summary
+    assert worker.calls.count("impl") >= 2 and worker.calls.count("review") == 2
+    assert ("review_rejected", "review") in events
+    # the re-run of impl saw the review notes
+    ctx = (repo.macc_dir / "context" / "impl.md").read_text()
+    assert "review rejected" in ctx and "needs tests" in ctx
+    assert any(d["title"].startswith("Review round") for d in store.decisions())
+
+
+async def test_review_reject_loop_is_bounded(repo):
+    tasks = [
+        Task("impl", "impl", owns=["x/**"]),
+        Task("review", "review", kind=Kind.REVIEW.value, deps=["impl"], owns=["docs/**"],
+             spec="mock:reject_first mock:reject_always", max_attempts=2),
+    ]
+    # make mock reject on every attempt
+    worker = MockWorker()
+    orig = worker.__call__
+
+    async def always_reject(task, wt, pack):
+        r = await orig(task, wt, pack)
+        if task.kind == "review":
+            r.fields["notes_for_downstream"] = "REJECT: still bad"
+        return r
+    worker.__call__ = always_reject  # type: ignore
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    s = Scheduler(repo, store, g, always_reject)
+    summary = await s.run()
+    assert g.tasks["review"].state == State.FAILED.value
+    assert summary["failed"] == ["review"]
+    assert worker.calls.count("review") == 2       # bounded by max_attempts

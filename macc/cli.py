@@ -150,7 +150,9 @@ def cmd_status(a) -> int:
         print(f"\nopen debts ({len(debts)}):")
         for d in debts:
             print(f"  #{d['id']} [{d['kind']}] {d['task_id']}: {d['note']}")
-    print("\nusage:", store.usage_totals())
+    u = store.usage_totals()
+    print(f"\nusage: runs={u['runs']} in={u['input_tokens']} out={u['output_tokens']} "
+          f"cache_read={u['cache_read_tokens']} cost=${u['cost_usd']:.2f} worker_time={u['seconds']:.0f}s")
     for row in store.usage_by_kind():
         print(f"  {row['kind']:<10} runs={row['runs']} avg_tokens={row['avg_tokens']:.0f} "
               f"avg_s={row['avg_seconds']:.1f} success={row['success_rate']:.2f}")
@@ -209,9 +211,17 @@ def cmd_debts(a) -> int:
 
 def cmd_events(a) -> int:
     repo, store = _open(a.repo)
+    last = 0
     for e in store.events(task_id=a.task, limit=a.n):
         ts = time.strftime("%m-%d %H:%M:%S", time.localtime(e["ts"]))
-        print(f"{ts} {e['type']:<24} {e['task_id'] or '-':<20} {e['payload'] or ''}"[:200])
+        print(f"{ts} {e['type']:<24} {e['task_id'] or '-':<20} {e['payload'] or ''}"[:200], flush=True)
+        last = e["seq"]
+    while a.follow:
+        time.sleep(1.0)
+        for e in store.events(task_id=a.task, since_seq=last, limit=200):
+            ts = time.strftime("%m-%d %H:%M:%S", time.localtime(e["ts"]))
+            print(f"{ts} {e['type']:<24} {e['task_id'] or '-':<20} {e['payload'] or ''}"[:200], flush=True)
+            last = e["seq"]
     return 0
 
 
@@ -246,6 +256,7 @@ def main(argv=None) -> int:
     sp.set_defaults(fn=cmd_retry)
     sp = sub.add_parser("debts"); sp.add_argument("--resolve", type=int, default=None); sp.set_defaults(fn=cmd_debts)
     sp = sub.add_parser("events"); sp.add_argument("--task", default=None); sp.add_argument("--n", type=int, default=50)
+    sp.add_argument("--follow", "-f", action="store_true", help="keep printing new events (use in a second terminal)")
     sp.set_defaults(fn=cmd_events)
 
     a = p.parse_args(argv)

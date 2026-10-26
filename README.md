@@ -20,7 +20,15 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.1)
+## What it does today (v0.2)
+
+- **Planner in one call**: `macc plan --from "feature description"` inspects the repo read-only and emits a plan
+  YAML; the program validates it (cycles, contract-first, ownership overlap, missing gates) and you review it.
+- **Ownership is enforced, not suggested**: a PreToolUse hook blocks edits outside a task's `owns`.
+- **Independent review with teeth**: a `review` task's REJECT reopens the reviewed tasks with the notes; the
+  loop is bounded by the review task's `max_attempts`.
+- **Merge agent**: textual conflicts go to a worker that sees only the conflicting files plus both handoffs.
+- **Broken environment ≠ broken task**: a gate that fails on the baseline blocks the task without charging an attempt.
 
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other.
 - **Contract-first**: tasks of kind `contract` must precede anything touching the same paths.
@@ -52,13 +60,15 @@ python -m pytest -q
 ```bash
 cd /path/to/your/repo
 macc init
-macc plan /path/to/MultiAccelerateCC/examples/webapp.yaml
+macc plan --from "Add a todo API with a web UI and e2e tests" plan.yaml   # or hand-write it
+macc plan plan.yaml
 macc run --worker mock --parallel 4 --gate true   # dry run, no tokens
 macc run --parallel 3 --budget 400000             # real claude -p workers
 macc status
 macc change contract --spec "add auth" --why "customer asked for SSO"   # invalidates downstream
 macc split backend --plan sub.yaml                 # dynamic decomposition
 macc debts
+macc events --follow                               # in a second terminal
 ```
 
 Project-specific rules for workers go in `.macc/rules.md` (keep it short; it is prepended to

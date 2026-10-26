@@ -74,10 +74,17 @@ Effort is per task, not per session: `contract`/`review`/`integrate` high, ordin
 medium, `max` only for a single reproduce-the-failure task. Done conditions are explicit so
 workers stop re-verifying.
 
-## 8. What is deliberately missing in v0.1
+## 8. Model calls (v0.2)
 
-- No LLM planner: plans are YAML you (or a Claude session) write. `macc split` is manual.
-- No code-dependency graph: impact analysis is by task graph only.
-- No cost model for split/no-split.
-- Conflict resolution is retry-on-fresh-base only.
-- Review tasks produce a verdict but don't automatically reopen the reviewed tasks.
+| Call | Kind | Tools | Context | Bounded by |
+|---|---|---|---|---|
+| planner | `plan` | read-only | repo + description | 2 rounds, program validation |
+| worker | `code`/`contract`/`spike`/`integrate` | full, ownership-guarded by PreToolUse hook | context pack | `max_attempts`, token budget |
+| reviewer | `review` | read-only | diff + tests | `max_attempts` rejection rounds |
+| merge agent | `merge` | full, restricted to conflicting files | conflict spec + both handoffs | one shot, then retry-on-fresh-base |
+
+## 9. What is deliberately missing
+
+- No code-dependency graph: impact analysis is by task graph only (v0.3).
+- No cost model for split/no-split; `macc split` is manual (v0.3).
+- Bash writes bypass the ownership hook; the diff still reveals them, but they are not blocked.

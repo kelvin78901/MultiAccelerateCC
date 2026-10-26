@@ -136,7 +136,7 @@ wall weight is ~0 unless it *is* the maximum. Every task, serial or not, counts 
   independent modules: the planner put the work in the wrong place.
 - Budget reservations and `serial_bottleneck` use the same per-kind numbers (already partly true).
 
-**2. Cut the serial overhead, biggest first.**
+**2. Cut the serial overhead, biggest first.** (2a and 2b done in v0.3.0, see below.)
 - *Review (largest single node, 108-188 s, $0.73-1.35, 30% of cost).*
   (a) Tier it by risk: diff size, files touched and whether public interfaces changed decide sonnet vs
   opus and effort; the refactor's review (behaviour-preserving, fully gated) did not need opus/high.
@@ -156,6 +156,25 @@ wall weight is ~0 unless it *is* the maximum. Every task, serial or not, counts 
 - *Planner.* $0.79-1.35 and 150-320 s per feature (18% of cost): reuse its repository reading across
   `plan --from` calls in the same repo (file list, contracts, gate) and skip re-reading what has not
   changed since the last plan.
+
+**Done (v0.3.0): review tiering and fact hand-off.** At review dispatch macc diffs this plan's change
+(`plan_base` = integration HEAD at `macc plan`; `MACC_BASE` would also count earlier unmerged plans) and
+rates it high when any of: > 5 new public defs/classes/routes (a new interface), > 400 changed source lines
+(tests and docs excluded), an existing test file lost lines, an open debt, or no green full gate on the
+reviewed tree. Low → that dispatch runs on `sonnet`/`medium` (`review_tier` event; the plan keeps opus).
+Every review's context pack gets a facts section: diff stat by source/tests/docs, new public symbols,
+the contract files to check against, all open debts on its ancestors, and "do not re-run the suite".
+Applied retroactively to the four runs:
+
+| review | source lines | new public API | tier | what the opus review actually did |
+|---|---|---|---|---|
+| watch r1 (new feature) | 283 | 17 | high | 172 s / $1.03, found M1, M2, L1 |
+| watch r2 (fix round) | 15 | 0 | low | 108 s / $0.73 |
+| insights (new feature) | 484 | 31 | high | 152 s / $1.19, found F1-F4 |
+| refactor | 222 | 4 | low | 188 s / $1.35, 128-request differential probe, no findings |
+
+Opus stays where it found things; the two low-risk reviews ($2.08 of the $4.30 spent on reviews) move to
+sonnet. Not yet measured live: whether a sonnet review on a low-tier change misses anything.
 
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus

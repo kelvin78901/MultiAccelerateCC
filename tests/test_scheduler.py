@@ -767,3 +767,66 @@ async def test_skip_can_be_disabled(repo):
     s, store, g, worker, events, summary = await run(repo, _integrate_plan(), integration_gates=["true"],
                                                      skip_noop_integrate=False)
     assert "i" in worker.calls and ("integrate_skipped", "i") not in events
+
+
+def _review_plan():
+    return [Task("c", "c", kind=Kind.CONTRACT.value, owns=["api/CONTRACT.md"]),
+            Task("a", "a", deps=["c"], owns=["src/a.py"]),
+            Task("i", "i", kind=Kind.INTEGRATE.value, deps=["a"], owns=["src/**"]),
+            Task("r", "r", kind=Kind.REVIEW.value, deps=["i"], owns=["docs/**"], model="opus", effort="high")]
+
+
+def _recording_worker():
+    worker, seen = MockWorker(), {}
+    orig = worker.__call__
+
+    async def w(task, wt, pack):
+        seen[task.id] = (task.model, task.effort, pack)
+        return await orig(task, wt, pack)
+    w.name = "mock"
+    return worker, w, seen
+
+
+async def test_low_risk_review_runs_on_the_cheaper_tier_with_facts(repo):
+    worker, w, seen = _recording_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["true"])
+    assert summary["finished"]
+    assert seen["r"][:2] == ("sonnet", "medium")                  # this dispatch only...
+    assert g.tasks["r"].model == "opus" and g.tasks["r"].effort == "high"   # ...the plan is unchanged
+    tier = next(e for e in store.events(limit=500) if e["type"] == "review_tier")
+    assert '"tier": "low"' in tier["payload"] and '"applied": true' in tier["payload"]
+    pack = seen["r"][2]
+    assert "# Facts for the review" in pack and "api/CONTRACT.md" in pack and "review tier: low" in pack
+    assert (repo.macc_dir / "context" / "r.md").read_text() == pack
+
+
+async def test_high_risk_review_keeps_the_planned_model(repo):
+    worker, w, seen = _recording_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["true"],
+                                                review_low_risk_max_lines=0)
+    assert seen["r"][:2] == ("opus", "high")
+    assert "review tier: high (1 source lines changed (> 0))" in seen["r"][2]
+
+
+async def test_review_tiering_can_be_disabled_but_facts_remain(repo):
+    worker, w, seen = _recording_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["true"],
+                                                review_tiering=False)
+    assert seen["r"][:2] == ("opus", "high") and "# Facts for the review" in seen["r"][2]
+
+
+async def test_review_tier_measures_this_plans_change_from_plan_base(repo):
+    # an earlier plan left a large, unmerged change on integration; this plan's own change is tiny
+    ipath = repo.ensure_integration()
+    (ipath / "big").mkdir()
+    for i in range(8):
+        (ipath / "big" / f"m{i}.py").write_text("".join(f"def f{i}_{j}():\n    return {j}\n" for j in range(40)))
+    repo.commit_all(ipath, "earlier plan, not merged into main")
+    plan_base = repo.head(ipath)
+    worker, w, seen = _recording_worker()
+    s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["true"],
+                                                plan_base=plan_base)
+    assert seen["r"][:2] == ("sonnet", "medium")                    # only this plan's 1-line change counts
+    s2, store2, g2, _, _, _ = await run(repo, _review_plan(), worker=w, integration_gates=["true"])
+    assert seen["r"][:2] == ("opus", "high")                        # MACC_BASE would include the earlier plan
+    assert "new public symbols" in seen["r"][2] or "source lines changed" in seen["r"][2]

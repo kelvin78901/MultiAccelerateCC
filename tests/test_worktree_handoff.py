@@ -218,3 +218,75 @@ def test_interpreter_conflicts():
     assert f(abs_rules, "use ~/p/.venv/bin/python") == []                           # both absolute
     assert f(".venv/bin/python", ".venv/bin/python") == []                          # both relative
     assert f(abs_rules, "no interpreter named here") == []
+
+
+def test_classify_path():
+    from macc.handoff import classify_path as c
+    assert [c(p) for p in ("tests/test_a.py", "pkg/tests/x.py", "src/foo.test.ts", "tests/fixtures/x.json")] == ["test"] * 4
+    assert [c(p) for p in ("docs/r.md", "alr/api/CONTRACT.md", "README.md")] == ["doc"] * 3
+    assert [c(p) for p in ("alr/api/errors.py", "web/index.html", "Makefile")] == ["source"] * 3
+
+
+def test_review_risk_tiers():
+    from macc.handoff import review_risk
+    f = lambda path, a, d, st="M": {"path": path, "status": st, "added": a, "deleted": d}  # noqa: E731
+    small = [f("alr/x.py", 120, 30), f("tests/test_x.py", 200, 0, "A"), f("docs/r.md", 50, 0, "A")]
+    assert review_risk(small, 0, True) == ("low", [], {"files": 3, "source_files": 1, "source_lines": 150,
+                                                        "test_lines": 200, "doc_lines": 50, "modified_tests": [],
+                                                        "new_public_api": 0})
+    # appending tests to an existing file is not "changing" them; deleting lines from one is
+    assert review_risk([f("tests/test_old.py", 40, 0)], 0, True)[0] == "low"
+    tier, reasons, _ = review_risk([f("tests/test_old.py", 3, 5)], 0, True)
+    assert tier == "high" and "existing tests changed" in reasons[0]
+    assert review_risk([f("alr/x.py", 300, 101)], 0, True)[1] == ["401 source lines changed (> 400)"]
+    assert review_risk(small, 2, True)[1] == ["2 open debt(s)"]
+    assert review_risk(small, 0, False)[1] == ["full gate not green on this tree"]
+    assert review_risk(small, 0, None)[1] == ["no full-gate result for this tree"]
+    assert review_risk([f("img.png", None, None)], 0, True)[0] == "low"      # binary: counted as a file, 0 lines
+
+
+def test_review_facts_text():
+    from macc.handoff import review_facts
+    stats = {"files": 4, "source_files": 2, "source_lines": 90, "test_lines": 40, "doc_lines": 10,
+             "modified_tests": ["tests/test_old.py"]}
+    txt = review_facts(stats, "high", ["existing tests changed: ['tests/test_old.py']"], ["alr/api/CONTRACT.md"],
+                       [{"kind": "stub", "task_id": "a", "note": "retry not wired"}], "a" * 40)
+    assert "source 2 files / 90 lines" in txt and "review tier: high (existing tests changed" in txt
+    assert "check they were not weakened" in txt and "alr/api/CONTRACT.md" in txt
+    assert "[stub] a: retry not wired" in txt and "Do not re-run the full test suite" in txt
+    assert "open debts: none" in review_facts({**stats, "modified_tests": []}, "low", [], [], [], None)
+
+
+def test_diff_files_statuses_and_counts(repo):
+    base = repo.head()
+    (repo.root / "README.md").write_text("hello\nworld\n")                   # M: +1
+    (repo.root / "new.py").write_text("a = 1\nb = 2\n")                       # A: +2
+    subprocess.run(["git", "mv", "api.py", "service.py"], cwd=repo.root, check=True)   # R
+    (repo.root / "logo.bin").write_bytes(b"\x00\x01\x02")                    # binary
+    subprocess.run(["git", "add", "-A"], cwd=repo.root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "changes"], cwd=repo.root, check=True)
+    files = {f["path"]: f for f in repo.diff_files(base, "HEAD", cwd=repo.root)}
+    assert files["README.md"] == {"path": "README.md", "status": "M", "added": 1, "deleted": 0}
+    assert files["new.py"]["status"] == "A" and files["new.py"]["added"] == 2
+    assert files["service.py"]["status"] == "R" and "api.py" not in files
+    assert files["logo.bin"]["added"] is None
+
+
+def test_public_api_delta_and_new_interface_tier():
+    from macc.handoff import public_api_delta, review_risk
+    diff = "\n".join([
+        "+++ b/alr/api/errors.py", "+def install_json_errors(app, prefixes):", "+def _helper():",
+        "+class ErrorBody(BaseModel):",
+        "+++ b/alr/api/watch.py", "-def install_error_handlers(app):", "-def get_con():",
+        "+++ b/alr/api/common.py", "+def get_con():",                      # moved, not new
+        "+++ b/alr/api/insights.py", '+@router.get("/insights/segments")', "+async def segments():",
+        "+++ b/tests/test_x.py", "+def test_new():",                       # tests do not count
+        "+++ b/docs/x.md", "+def not_code():"])
+    added, removed = public_api_delta(diff)
+    assert added == {"install_json_errors", "ErrorBody", "route /insights/segments", "segments"}
+    assert removed == {"install_error_handlers"}
+    f = [{"path": "alr/x.py", "status": "A", "added": 50, "deleted": 0}]
+    assert review_risk(f, 0, True, new_public_api=5)[0] == "low"
+    tier, reasons, stats = review_risk(f, 0, True, new_public_api=6)
+    assert tier == "high" and "6 new public symbols/routes (> 5): new interface" in reasons
+    assert stats["new_public_api"] == 6

@@ -138,6 +138,100 @@ def merge_conflict_spec(task: Task, conflicts: list[str], others: list[dict]) ->
     return "\n".join(lines)
 
 
+_DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+
+
+def classify_path(path: str) -> str:
+    """'test', 'doc' or 'source' (review risk counts source lines only)."""
+    parts = path.split("/")
+    name = parts[-1]
+    if any(seg in ("tests", "test", "__tests__", "spec") for seg in parts[:-1]) or name.startswith("test_") \
+            or name.endswith(("_test.py", ".test.ts", ".test.js", ".spec.ts", ".spec.js", "Test.kt", "Test.java")) \
+            or "/fixtures/" in f"/{path}":
+        return "test"
+    if name.endswith(_DOC_SUFFIXES) or parts[0] in ("docs", "doc"):
+        return "doc"
+    return "source"
+
+
+_PUBLIC = re.compile(r"^([+-])\s*(?:async\s+)?(?:def|class|function|fun|interface)\s+([A-Za-z]\w*)"
+                     r"|^([+-])\s*@(?:app|router|\w+_router)\.(?:get|post|put|delete|patch)\(\s*[\"']([^\"']+)")
+
+
+def public_api_delta(diff: str) -> tuple[set[str], set[str]]:
+    """Public symbols (defs/classes without a leading underscore, HTTP routes) added and removed by a
+    unified diff, source files only. Moving a symbol between files counts as neither."""
+    cur, added, removed = None, set(), set()
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            cur = line[6:] if line.startswith("+++ b/") else None
+            continue
+        if line.startswith("--- ") or not cur or classify_path(cur) != "source":
+            continue
+        m = _PUBLIC.match(line)
+        if m:
+            sign, sym = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), "route " + m.group(4))
+            (added if sign == "+" else removed).add(sym)
+    return added - removed, removed - added
+
+
+def review_risk(files: list[dict], open_debts: int, gate_green: Optional[bool],
+                max_source_lines: int = 400, new_public_api: int = 0,
+                max_new_public_api: int = 5) -> tuple[str, list[str], dict]:
+    """Decide how much reviewer a change needs, from facts only.
+    Returns (tier 'low'|'high', reasons for 'high' (empty for low), stats)."""
+    stats = {"files": len(files), "source_files": 0, "source_lines": 0, "test_lines": 0, "doc_lines": 0,
+             "modified_tests": [], "new_public_api": new_public_api}
+    for f in files:
+        kind = classify_path(f["path"])
+        lines = (f["added"] or 0) + (f["deleted"] or 0)
+        if kind == "source":
+            stats["source_files"] += 1
+            stats["source_lines"] += lines
+        elif kind == "test":
+            stats["test_lines"] += lines
+            if f["status"] in ("M", "D", "R") and (f["deleted"] or 0) > 0:
+                stats["modified_tests"].append(f["path"])
+        else:
+            stats["doc_lines"] += lines
+    reasons = []
+    if new_public_api > max_new_public_api:
+        reasons.append(f"{new_public_api} new public symbols/routes (> {max_new_public_api}): new interface")
+    if stats["source_lines"] > max_source_lines:
+        reasons.append(f"{stats['source_lines']} source lines changed (> {max_source_lines})")
+    if stats["modified_tests"]:
+        reasons.append(f"existing tests changed: {stats['modified_tests'][:5]}")
+    if open_debts:
+        reasons.append(f"{open_debts} open debt(s)")
+    if gate_green is not True:
+        reasons.append("full gate not green on this tree" if gate_green is False
+                       else "no full-gate result for this tree")
+    return ("high" if reasons else "low"), reasons, stats
+
+
+def review_facts(stats: dict, tier: str, reasons: list[str], contracts: list[str], debts: list[dict],
+                 base: Optional[str]) -> str:
+    """What the scheduler already knows, so the reviewer reads the change instead of rediscovering it."""
+    lines = ["# Facts for the review (computed by the scheduler; do not re-derive them)",
+             f"- change since {base[:12] if base else 'the base'}: {stats['files']} files; source "
+             f"{stats['source_files']} files / {stats['source_lines']} lines, tests {stats['test_lines']} lines, "
+             f"docs {stats['doc_lines']} lines; {stats.get('new_public_api', 0)} new public symbols/routes. "
+             f"`git diff {base[:12] if base else '$MACC_BASE'}` shows it.",
+             f"- review tier: {tier}" + (f" ({'; '.join(reasons)})" if reasons else
+                                         " (small source change, no new interface, existing tests untouched, "
+                                         "gates green)")]
+    if stats["modified_tests"]:
+        lines.append(f"- existing tests that were changed (check they were not weakened): {stats['modified_tests']}")
+    lines.append("- contracts to check the code against: " + (", ".join(contracts) if contracts else "(none)"))
+    if debts:
+        lines.append("- open debts: " + "; ".join(f"[{d['kind']}] {d['task_id']}: {d['note'][:120]}" for d in debts[:10]))
+    else:
+        lines.append("- open debts: none")
+    lines.append("- Do not re-run the full test suite unless the gate section below says it is missing or failed; "
+                 "spend the time on reading the diff, the contract and targeted probes.")
+    return "\n".join(lines)
+
+
 def _full_gate_note(ev: dict, integration_head: Optional[str]) -> str:
     """Tell a reviewer what the scheduler already verified, so it does not re-run the whole suite.
     The claim holds only if the gate ran on the tree being reviewed (same integration HEAD)."""

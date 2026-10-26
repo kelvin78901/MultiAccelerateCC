@@ -147,6 +147,7 @@ def cmd_plan(a) -> int:
     g.refresh_hashes()
     store.save_graph(g)
     cfg["cost_baseline_usd"] = store.usage_totals()["cost_usd"]   # budget counts from here
+    cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
     return 0

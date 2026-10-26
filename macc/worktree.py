@@ -86,6 +86,40 @@ class Repo:
     def head(self, cwd: Optional[Path] = None) -> str:
         return self.git("rev-parse", "HEAD", cwd=cwd).stdout.strip()
 
+    def diff_files(self, base: str, head: str = "HEAD", cwd: Optional[Path] = None) -> list[dict]:
+        """Per changed file: path, status (A/M/D/R/C...), added and deleted line counts (None for binary)."""
+        where = cwd or self.integration_path
+        status: dict[str, str] = {}
+        recs = self.git("diff", "--name-status", "-z", base, head, cwd=where).stdout.split("\0")
+        i = 0
+        while i < len(recs):
+            st = recs[i]
+            i += 1
+            if not st:
+                continue
+            if st[0] in "RC":                  # rename/copy: old path, new path
+                status[recs[i + 1]] = st[0]
+                i += 2
+            else:
+                status[recs[i]] = st[0]
+                i += 1
+        out = []
+        # -z numstat: "a\td\tpath\0", or for a rename "a\td\t\0old\0new\0"
+        recs = self.git("diff", "--numstat", "-z", base, head, cwd=where).stdout.split("\0")
+        i = 0
+        while i < len(recs):
+            rec = recs[i]
+            i += 1
+            if not rec:
+                continue
+            a, d, path = rec.split("\t", 2)
+            if not path:
+                path = recs[i + 1]
+                i += 2
+            out.append({"path": path, "status": status.get(path, "M"),
+                        "added": None if a == "-" else int(a), "deleted": None if d == "-" else int(d)})
+        return out
+
     def tree(self, cwd: Path) -> str:
         """Tree hash of HEAD: equal trees mean identical file contents, whatever the commit history."""
         return self.git("rev-parse", "HEAD^{tree}", cwd=cwd).stdout.strip()

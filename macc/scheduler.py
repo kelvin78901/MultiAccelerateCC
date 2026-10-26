@@ -14,13 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
 from .graph import ACTIVE, Kind, State, Task, TaskGraph
 from .handoff import (build_context_pack, generate_handoff, interpreter_conflicts, merge_conflict_spec,
-                      parse_reopen, parse_verdict)
+                      parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -40,6 +40,14 @@ class SchedulerConfig:
     revalidate_stale: bool = True
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
     skip_noop_integrate: bool = True             # integrate is skipped when gates are green and nothing is open
+    # review tiering: a low-risk change (small source diff, existing tests untouched, no open debts, full gate
+    # green on the reviewed tree) is reviewed with the cheaper model/effort for that dispatch
+    review_tiering: bool = True
+    review_low_risk_max_lines: int = 400
+    review_low_risk_max_new_api: int = 5         # new public defs/classes/routes; features add 17-31, the refactor 4
+    plan_base: Optional[str] = None              # integration HEAD when the plan was loaded: "this plan's change"
+    review_low_model: str = "sonnet"
+    review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
     cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
 
@@ -219,6 +227,10 @@ class Scheduler:
         wt = self.repo.create_task_worktree(t.id, fresh=True)
         head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
         pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head)
+        run_as = t
+        if t.kind == Kind.REVIEW.value:
+            facts, run_as = self._review_setup(t, head)
+            pack += "\n" + facts + "\n"
         self._check_rules_conflict(t, wt)
         if t.last_error:
             pack += f"\n# Previous attempt failed\n{t.last_error[-3000:]}\n"
@@ -227,8 +239,36 @@ class Scheduler:
         (ctx_dir / f"{t.id}.md").write_text(pack)
         self._persist(t.id)
         self.emit("dispatched", t.id, attempt=t.attempts, worktree=str(wt))
-        fut = asyncio.create_task(self._run_worker(t, wt, pack), name=f"macc:{t.id}")
+        fut = asyncio.create_task(self._run_worker(t, wt, pack, run_as), name=f"macc:{t.id}")
         self.running[t.id] = fut
+
+    def _review_setup(self, t: Task, head: Optional[str]) -> tuple[str, Task]:
+        """Facts for the reviewer's context pack, and the task as it should run (tiered model/effort)."""
+        # this plan's change, not everything unmerged into main (MACC_BASE would count earlier plans too)
+        base = self.cfg.plan_base or self.repo.macc_env().get("MACC_BASE")
+        files = self.repo.diff_files(base, "HEAD") if base else []
+        new_api = 0
+        if base:
+            diff = self.repo.git("diff", "-U0", base, "HEAD", cwd=self.repo.integration_path).stdout
+            new_api = len(public_api_delta(diff)[0])
+        last = self.store.latest_event("full_gate")
+        gate_green = (bool(last["payload"].get("ok")) if last and last["payload"].get("head") == head else None)
+        ancestors = self.graph.ancestors(t.id)
+        debts = [d for d in self.store.open_debts() if d["task_id"] in ancestors]
+        contracts = sorted({o for a in ancestors if self.graph.tasks[a].kind == Kind.CONTRACT.value
+                            for o in self.graph.tasks[a].owns
+                            if "*" not in o and (self.repo.integration_path / o).is_file()})
+        tier, reasons, stats = review_risk(files, len(debts), gate_green, self.cfg.review_low_risk_max_lines,
+                                           new_api, self.cfg.review_low_risk_max_new_api)
+        if not base:
+            tier, reasons = "high", reasons + ["no base to diff against"]
+        run_as = t
+        if self.cfg.review_tiering and tier == "low":
+            run_as = replace(t, model=self.cfg.review_low_model, effort=self.cfg.review_low_effort)
+        self.emit("review_tier", t.id, tier=tier, reasons=reasons, model=run_as.model, effort=run_as.effort,
+                  source_lines=stats["source_lines"], new_public_api=new_api, files=stats["files"],
+                  base=base, applied=run_as is not t)
+        return review_facts(stats, tier, reasons, contracts, debts, base), run_as
 
     def _check_rules_conflict(self, t: Task, wt: Path) -> None:
         """Advisory only: the worker still runs. Emitted once per distinct conflict per run."""
@@ -240,9 +280,10 @@ class Scheduler:
                 self._rules_conflicts_seen.add(msg)
                 self.emit("rules_conflict", t.id, message=msg)
 
-    async def _run_worker(self, t: Task, wt: Path, pack: str) -> tuple[str, Path, WorkerResult]:
+    async def _run_worker(self, t: Task, wt: Path, pack: str,
+                          run_as: Optional[Task] = None) -> tuple[str, Path, WorkerResult]:
         try:
-            res = await self.worker(t, wt, pack)
+            res = await self.worker(run_as or t, wt, pack)
         except asyncio.CancelledError:
             res = WorkerResult(ok=False, error="preempted", preempted=True)
         except Exception as e:  # worker crashed; never take the loop down

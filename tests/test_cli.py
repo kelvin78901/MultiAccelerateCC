@@ -140,3 +140,15 @@ def test_unfinished_contract_overlap_still_rejected():
     g = TaskGraph([Task("c", "c", kind="contract", owns=["api/**"]), Task("x", "x", owns=["api/x.py"])])
     with pytest.raises(GraphError, match="contracts must be serialised"):
         g.validate()
+
+
+def test_plan_records_plan_base(repo_dir, tmp_path):
+    import json
+    plan = tmp_path / "p.yaml"
+    plan.write_text("tasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n")
+    r = str(repo_dir)
+    assert main(["--repo", r, "plan", str(plan)]) == 0
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    head = subprocess.run(["git", "rev-parse", "macc/integration"], cwd=repo_dir, capture_output=True,
+                          text=True).stdout.strip()
+    assert cfg["plan_base"] == head

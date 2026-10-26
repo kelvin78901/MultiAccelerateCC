@@ -863,3 +863,20 @@ async def test_noop_integrate_fails_when_the_full_gate_fails(repo):
     s, store, g, _, events, summary = await run(repo, _review_plan(), worker=w, integration_gates=["false"],
                                                 skip_noop_integrate=False)
     assert g.tasks["i"].state in (State.FAILED.value, State.PENDING.value) and "r" not in seen
+
+
+async def test_revalidated_integrate_records_full_gate_so_review_can_be_tiered(repo):
+    worker, w, seen = _recording_worker()
+    store = Store(repo.macc_dir / "state.db")
+    tasks = _review_plan()
+    tasks[2].done_when = ["test -f src/a.py"]                          # integrate can revalidate on its gate
+    g = TaskGraph(tasks); g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"], skip_noop_integrate=False)
+    await Scheduler(repo, store, g, w, cfg).run()
+    g.update_spec("a", g.tasks["a"].spec + " (changed)")                # a `macc change` on the code task
+    seen.clear()
+    events = []
+    await Scheduler(repo, store, g, w, cfg, on_event=lambda t, tid, p: events.append((t, tid))).run()
+    assert ("revalidated", "i") in events and "i" not in seen          # integrate not re-run...
+    assert ("full_gate", "i") in events                                 # ...but proved the new tree green
+    assert seen["r"][:2] == ("sonnet", "medium")

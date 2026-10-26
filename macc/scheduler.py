@@ -129,6 +129,20 @@ class Scheduler:
             return by_kind[t.kind]
         return self.cost_used / self.runs_done if self.runs_done else 0.0
 
+    def _ensure_full_gate(self, tid: Optional[str]) -> Optional[dict]:
+        """Make sure the full integration gate has passed on the current integration HEAD (reusing a green
+        result recorded for that HEAD). Returns the failing gate record, or None when green."""
+        head = self.repo.head(self.repo.integration_path)
+        last = self.store.latest_event("full_gate")
+        if last and last["payload"].get("ok") and last["payload"].get("head") == head:
+            return None
+        gates = self.repo.run_gates(self.cfg.integration_gates)
+        self._record_gates(tid, gates, full=True)
+        bad = next((g for g in gates if not g["ok"]), None)
+        if bad is None:
+            self._merged_since_full_gate = False
+        return bad
+
     def _integrate_blockers(self, t: Task) -> list[str]:
         """Reasons an integrate task must really run. Empty list = it would have nothing to do."""
         reasons = []
@@ -153,13 +167,12 @@ class Scheduler:
         head = self.repo.head(self.repo.integration_path)
         last = self.store.latest_event("full_gate")
         reuse = bool(last and last["payload"].get("ok") and last["payload"].get("head") == head)
-        gates = [] if reuse else self.repo.run_gates(self.cfg.integration_gates)
-        if gates:
-            self._record_gates(t.id, gates, full=True)
-        own = self.repo.run_gates(t.done_when) if t.done_when else []
-        if not all(g["ok"] for g in gates + own):
+        if self._ensure_full_gate(t.id):
             return False                      # something to fix: run the integrate worker as planned
-        self._merged_since_full_gate = False
+        gates = [] if reuse else [{"cmd": c, "ok": True} for c in self.cfg.integration_gates]
+        own = self.repo.run_gates(t.done_when) if t.done_when else []
+        if not all(g["ok"] for g in own):
+            return False
         note = "skipped: gates green, nothing to integrate"
         handoff = {"task_id": t.id, "attempt": t.attempts, "files_changed": [], "api_changes": [],
                    "gates": [{"cmd": g["cmd"], "ok": g["ok"]} for g in gates + own], "gates_passed": True,
@@ -485,18 +498,12 @@ class Scheduler:
         elif t.kind == Kind.INTEGRATE.value and self.cfg.integration_gates:
             # an integrate that changed nothing still has to prove the tree is green: otherwise the review
             # after it sees no full-gate result for its tree (and cannot be tiered low)
-            head = self.repo.head(self.repo.integration_path)
-            last = self.store.latest_event("full_gate")
-            if not (last and last["payload"].get("ok") and last["payload"].get("head") == head):
-                fgates = self.repo.run_gates(self.cfg.integration_gates)
-                self._record_gates(tid, fgates, full=True)
-                bad = next((g for g in fgates if not g["ok"]), None)
-                if bad:
-                    self._fail(t, f"integrate changed nothing but the full gate fails: {bad['cmd']}\n"
-                                  f"{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
-                    self._cleanup(tid)
-                    return
-                self._merged_since_full_gate = False
+            bad = self._ensure_full_gate(tid)
+            if bad:
+                self._fail(t, f"integrate changed nothing but the full gate fails: {bad['cmd']}\n"
+                              f"{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
+                self._cleanup(tid)
+                return
         # 6. done + staleness propagation
         self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
         t.last_error = None
@@ -657,6 +664,10 @@ class Scheduler:
                           else "no gates to revalidate with")
             else:
                 gates = self.repo.run_gates(t.done_when)
+                if all(g["ok"] for g in gates) and t.kind == Kind.INTEGRATE.value and self.cfg.integration_gates:
+                    bad = self._ensure_full_gate(t.id)   # the review after it is tiered on this fact
+                    if bad:
+                        gates.append(bad)
                 if all(g["ok"] for g in gates):
                     t.state = State.DONE.value
                     self.emit("revalidated", t.id)

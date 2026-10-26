@@ -60,6 +60,7 @@ class Scheduler:
         self.tokens_used = 0
         # budget is cumulative over runs of the same plan: start from what was already spent since plan load
         self.cost_used = max(0.0, store.usage_totals()["cost_usd"] - self.cfg.cost_baseline_usd)
+        self._cost_at_start = self.cost_used      # cost_this_run = cost_used - this
         self.runs_done = 0
         if hasattr(worker, "gate_commands"):
             worker.gate_commands = list(self.cfg.integration_gates)
@@ -496,7 +497,9 @@ class Scheduler:
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),
             "tokens_used": self.tokens_used,
-            "cost_usd": round(self.cost_used, 4),
+            # `cost_usd` alone was ambiguous (it became "since plan load" with the cumulative budget)
+            "cost_this_run": round(self.cost_used - self._cost_at_start, 4),
+            "cost_since_plan": round(self.cost_used, 4),
             "seconds": round(time.time() - t0, 2),
             "stopped_reason": self.stopped_reason,
             "failed": [t.id for t in self.graph.tasks.values() if t.state == State.FAILED.value],

@@ -421,6 +421,27 @@ async def test_cost_budget_is_cumulative_across_runs(repo):
     assert summary["finished"]
 
 
+async def test_summary_separates_cost_this_run_from_cost_since_plan(repo):
+    class PricedWorker(MockWorker):
+        async def __call__(self, task, wt_path, context_pack):
+            res = await super().__call__(task, wt_path, context_pack)
+            res.cost_usd = 0.25
+            return res
+
+    store = Store(repo.macc_dir / "state.db")
+    store.add_usage("old", 1, "x", True, cost_usd=5.0)       # before this plan was loaded
+    store.add_usage("prev", 1, "x", True, cost_usd=1.5)      # an earlier run of this plan
+    g = TaskGraph([Task("t", "t", owns=["a/**"]), Task("u", "u", owns=["b/**"])]); g.validate()
+    events = []
+    s = Scheduler(repo, store, g, PricedWorker(), SchedulerConfig(cost_baseline_usd=5.0),
+                  on_event=lambda t, tid, p: events.append((t, p)))
+    summary = await s.run()
+    assert summary["cost_this_run"] == 0.5 and summary["cost_since_plan"] == 2.0
+    assert "cost_usd" not in summary
+    fin = next(p for t, p in events if t == "run_finished")
+    assert fin["cost_this_run"] == 0.5 and fin["cost_since_plan"] == 2.0
+
+
 async def test_orphaned_active_tasks_reset_on_restart(repo):
     store = Store(repo.macc_dir / "state.db")
     g = TaskGraph([Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"], merge_after=["a"])]); g.validate()

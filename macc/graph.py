@@ -271,11 +271,10 @@ class TaskGraph:
         for k, v in fields.items():
             setattr(t, k, v)
         t.input_hash = self.compute_input_hash(tid)
-        if t.state == State.DONE.value:
-            t.state = State.STALE.value
-        elif t.state in {s.value for s in ACTIVE}:
+        # the requirement itself changed: this node must be re-done, not merely re-validated
+        if t.state in {s.value for s in ACTIVE}:
             t.preempt = True
-        elif t.state == State.FAILED.value:
+        else:
             t.state = State.PENDING.value
             t.attempts = 0
         # its output will change, so everything below is stale too

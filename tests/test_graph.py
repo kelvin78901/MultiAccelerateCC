@@ -101,8 +101,8 @@ def test_update_spec_invalidates_self_and_downstream():
     g.mark_done("backend", "b1")
     g.tasks["frontend"].state = State.FAILED.value
     affected = g.update_spec("contract", "define openapi v2 with auth")
-    assert g.tasks["contract"].state == State.STALE.value
-    assert g.tasks["backend"].state == State.STALE.value
+    assert g.tasks["contract"].state == State.PENDING.value   # requirement changed -> must re-run
+    assert g.tasks["backend"].state == State.STALE.value      # upstream output will change -> revalidate
     assert g.tasks["frontend"].state == State.PENDING.value   # failed -> retry with new inputs
     assert set(affected) == {"contract", "backend", "frontend"}
     assert g.tasks["integrate"].state == State.PENDING.value  # never ran; nothing to invalidate

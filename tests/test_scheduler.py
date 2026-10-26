@@ -175,7 +175,7 @@ async def test_spec_change_mid_run_preempts_and_reruns(repo):
     await asyncio.gather(s.run(), change_design())
     assert g.tasks["up"].state == State.DONE.value and worker.calls.count("up") == 2
     assert g.tasks["down"].state == State.DONE.value and g.tasks["down"].attempts == 1
-    assert ("preempted", "down") in events and ("stale_rerun", "up") in events
+    assert ("preempted", "down") in events
     assert (repo.integration_path / "u" / "v2.txt").exists()
     assert worker.calls.count("down") == 2          # one cancelled run + one real run
     ctx = (repo.macc_dir / "context" / "down.md").read_text()
@@ -297,3 +297,20 @@ async def test_merge_agent_can_be_disabled(repo):
     s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2, merge_agent=False)
     types = [e for e, _ in events]
     assert "merge_agent" not in types and "retry" in types and summary["finished"]
+
+
+async def test_spec_change_reruns_node_and_review_but_revalidates_code(repo):
+    tasks = [
+        Task("impl", "impl", owns=["x/**"], done_when=["test -f x/impl.txt"]),
+        Task("other", "other", deps=["impl"], owns=["y/**"], done_when=["test -f y/other.txt"]),
+        Task("review", "review", kind=Kind.REVIEW.value, deps=["other"], owns=["docs/**"]),
+    ]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    assert summary["finished"]
+    g.update_spec("impl", "v2 mock:write=x/impl.txt")
+    s2 = Scheduler(repo, store, g, worker, on_event=lambda t, tid, p: events.append((t, tid)))
+    await s2.run()
+    assert worker.calls.count("impl") >= 2        # re-done (mock may need a 2nd attempt: identical content = "no changes")
+    assert worker.calls.count("other") == 1       # revalidated by its gate, not re-run
+    assert worker.calls.count("review") == 2      # reviews always re-run when stale
+    assert ("revalidated", "other") in events and ("stale_rerun", "review") in events

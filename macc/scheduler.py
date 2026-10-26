@@ -323,10 +323,11 @@ class Scheduler:
         for t in list(self.graph.tasks.values()):
             if t.state != State.STALE.value or not self.graph.deps_done(t.id):
                 continue
-            if not self.cfg.revalidate_stale or not t.done_when:
+            if not self.cfg.revalidate_stale or not t.done_when or t.kind == Kind.REVIEW.value:
                 t.state = State.PENDING.value
                 t.attempts = 0
-                self.emit("stale_rerun", t.id, reason="no gates to revalidate with")
+                self.emit("stale_rerun", t.id, reason="review must re-run" if t.kind == Kind.REVIEW.value
+                          else "no gates to revalidate with")
             else:
                 gates = self.repo.run_gates(t.done_when)
                 if all(g["ok"] for g in gates):

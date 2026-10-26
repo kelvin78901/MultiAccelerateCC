@@ -67,6 +67,22 @@ def cmd_init(a) -> int:
     return 0
 
 
+def _prediction_lines(g, store: Store, cfg: dict) -> list[str]:
+    """The cost model's numbers for a plan (and split hints only when enabled in config)."""
+    from .costmodel import describe, predict, reconstruct_serial_flags, split_hints
+    try:
+        reconstruct_serial_flags(store)
+        pred = predict(g, store, max_parallel=int(cfg.get("max_parallel", 4)))
+    except Exception as e:                      # never block planning on the model
+        return [f"prediction unavailable: {e!r}"[:200]]
+    lines = [describe(pred)]
+    if cfg.get("split_hints"):
+        floor = store._conn.execute("SELECT MIN(seconds) m FROM usage WHERE kind='code' AND model IS NOT NULL "
+                                    "AND ok=1").fetchone()["m"] or 30.0
+        lines += [f"split hint: {h}" for h in split_hints(pred, floor)]
+    return lines
+
+
 def cmd_plan(a) -> int:
     repo, store = _open(a.repo)
     if a.from_desc:
@@ -116,6 +132,7 @@ def cmd_plan(a) -> int:
                 if bad:
                     pr.warnings.append(f"proposed integration gate FAILS on the current integration tree: {bad[0]['cmd']!r} "
                                        f"-> every task would be BLOCKED (gate_broken_baseline)")
+        pr.warnings.extend(_prediction_lines(g, store, pr.config or cfg_now))
         if pr.warnings:
             print("\nWARNINGS (fix before `macc plan`):")
             for w in pr.warnings:
@@ -150,6 +167,8 @@ def cmd_plan(a) -> int:
     cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
+    for line in _prediction_lines(g, store, cfg):
+        print(line)
     return 0
 
 
@@ -217,6 +236,12 @@ def cmd_status(a) -> int:
         ratio = f" (actual/est={cp['actual_over_est']:.3f})" if cp.get("actual_over_est") is not None else ""
         print(f"last run critical path: {' -> '.join(cp['tasks'])}: actual {cp['actual_s']:.0f} s, "
               f"est {cp['est_min']:.0f} min{ratio}")
+    pv = (last or {}).get("payload", {}).get("prediction") if last else None
+    if pv and pv.get("error"):
+        e = pv["error"]
+        pct = lambda x: "n/a" if x is None else f"{x:+.0%}"   # noqa: E731  (no actual cost on mock runs)
+        print(f"last run prediction: wall {pv['wall_s']:.0f} s ({pct(e['wall'])}), cost ${pv['cost_usd']:.2f} "
+              f"({pct(e['cost'])}), serial share {pv['serial_share']:.0%} ({e['serial_share'] * 100:+.0f} pt) vs actual")
     ser = (last or {}).get("payload", {}).get("serial") if last else None
     if ser and ser.get("tasks"):
         print(f"last run serial share: {ser['share']:.0%} ({ser['seconds']:.0f} s in {', '.join(ser['tasks'])})")

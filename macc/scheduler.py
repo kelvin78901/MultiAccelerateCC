@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
+from .costmodel import error as cm_error, predict, reconstruct_serial_flags
 from .graph import ACTIVE, Kind, State, Task, TaskGraph
 from .handoff import (build_context_pack, generate_handoff, interpreter_conflicts, merge_conflict_spec,
                       classify_path, parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
@@ -48,6 +49,8 @@ class SchedulerConfig:
     review_low_risk_max_new_api: int = 5         # new public defs/classes/routes; features add 17-31, the refactor 4
     plan_base: Optional[str] = None              # integration HEAD when the plan was loaded: "this plan's change"
     flake_check_runs: int = 3                    # at integrate: run this plan's new test files N times, random seeds
+    # cost-model split hints stay off until its backtest error is within 30% (v0.3.5: mean wall error 32%)
+    split_hints: bool = False
     review_low_model: str = "sonnet"
     review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
@@ -79,6 +82,7 @@ class Scheduler:
         self.gate_seconds = 0.0                   # wall time spent in post-merge gates this run
         self._budget_deferred: set[str] = set()
         self._serial_points: set[str] = set()     # tasks every other unfinished task waited for (this run)
+        self.prediction: Optional[dict] = None
         self.serial_seconds = 0.0
         self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
         self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
@@ -372,7 +376,8 @@ class Scheduler:
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
-                             est_minutes=t.est_minutes, kind=t.kind)
+                             est_minutes=t.est_minutes, kind=t.kind, serial=tid in self._serial_points,
+                             **self._predicted_for(tid))
 
         if res.preempted or t.preempt:
             t.attempts = max(0, t.attempts - 1)       # a preempted run is not a failed attempt
@@ -584,6 +589,18 @@ class Scheduler:
                 self.emit("preempt_requested", c, because=tid)
         self._cleanup(tid)
 
+    def _prediction_vs_actual(self, wall: float) -> Optional[dict]:
+        if not self.prediction:
+            return None
+        p = {k: self.prediction[k] for k in ("wall_s", "cost_usd", "serial_share")}
+        p["error"] = cm_error(self.prediction, wall, self.cost_used - self._cost_at_start,
+                              self.serial_seconds / wall if wall > 0 else 0.0)
+        return p
+
+    def _predicted_for(self, tid: str) -> dict:
+        p = (self.prediction or {}).get("per_task", {}).get(tid)
+        return {"pred_seconds": p["seconds"], "pred_cost": p["cost"]} if p else {}
+
     def critical_path_this_run(self) -> dict:
         """Longest chain (hard deps) of tasks that ran in this run, by actual worker seconds, with the
         planner's estimate for the same chain. merge_after is not a chain: those tasks run in parallel."""
@@ -765,6 +782,13 @@ class Scheduler:
         self.graph.refresh_hashes()
         self._persist()
         self.emit("run_started", None, tasks=len(self.graph.tasks), max_parallel=self.cfg.max_parallel)
+        try:
+            reconstruct_serial_flags(self.store)
+            self.prediction = predict(self.graph, self.store, max_parallel=self.cfg.max_parallel)
+            self.emit("prediction", None, **{k: v for k, v in self.prediction.items() if k != "per_task"})
+        except Exception as e:                  # the model only reports; it must never stop a run
+            self.prediction = None
+            self.emit("prediction_failed", None, error=repr(e)[:300])
         t0 = time.time()
         while True:
             self._revalidate_stale()
@@ -808,6 +832,7 @@ class Scheduler:
             "serial": {"tasks": sorted(self._serial_points), "seconds": round(self.serial_seconds, 1),
                        "share": round(self.serial_seconds / wall, 3) if wall > 0 else 0.0},
             "critical_path": self.critical_path_this_run(),
+            "prediction": self._prediction_vs_actual(wall),
             "gate_policy": self.cfg.gate_policy,
             "gate_seconds": round(self.gate_seconds, 2),
             "final_gate": final_gate,

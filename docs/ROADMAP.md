@@ -207,6 +207,31 @@ allow the project interpreter itself (a `PYTHONPATH=. …` gate produced `Bash(P
 worked only by accident and one review could not run Python); a re-run review that commits nothing is
 retried with "write a fresh report" (the earlier round's file satisfied its done_when).
 
+**Done (v0.3.5): phase cost model, predict only** (`macc/costmodel.py`). wall = Σ serial-point time +
+Σ phases max(longest chain, work / parallelism) + full-gate time; cost = Σ per-task cost. A serial point
+is weighted with the median actual seconds of its kind *when it ran as a serial point* (`usage.serial`,
+recorded live and reconstructed from the event log for older runs); other tasks with their kind's
+median; no tuned constants. Shown with the plan warnings (`plan --from`) and on `macc plan`; at the end
+of a run compared with the actual values (`run_finished.prediction.error`, `macc status`), with the
+per-task prediction stored next to the actual in `usage.pred_seconds` / `pred_cost`.
+
+Backtest, leave-one-out (prediction / actual):
+
+| run | wall | cost | serial share |
+|---|---|---|---|
+| watch r1 | 453 / 585 s (−23%) | $3.88 / $4.05 (−4%) | 82% / 71% |
+| watch r2 (fix round) | 193 / 144 s (+34%) | $1.50 / $1.05 (+42%) | 79% / 75% |
+| insights | 463 / 1683 s (−72%) | $4.54 / $5.65 (−20%) | 80% / 94% |
+| refactor | 420 / 425 s (−1%) | $3.31 / $3.51 (−6%) | 90% / 88% |
+
+2 of 4 within 30% on wall and cost; mean error wall 32%, cost 18%, serial share 8 points. The misses
+have identifiable causes, not noise: insights' contract ran 1350 s against a 155 s median (the
+pre-computed-answers contract v0.2.12 now rejects; `serial_bottleneck` is the live signal for it), and fix
+rounds are cheaper than first rounds (watch r2's review 108 s vs 152 s). A later low-tier round (routes C)
+was +267% on cost because the model does not yet know the review tier (sonnet $0.21 vs the opus-dominated
+review median). **Split hints stay off** (`split_hints: false`) until the error is within 30%; next
+model inputs: review tier (model-specific medians) and first round vs fix round.
+
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus
 the review, and integrate was revalidated by its gates; wall time there was 75% review. Nothing in the

@@ -152,3 +152,12 @@ def test_plan_records_plan_base(repo_dir, tmp_path):
     head = subprocess.run(["git", "rev-parse", "macc/integration"], cwd=repo_dir, capture_output=True,
                           text=True).stdout.strip()
     assert cfg["plan_base"] == head
+
+
+def test_plan_load_prints_prediction(repo_dir, tmp_path, capsys):
+    plan = tmp_path / "p.yaml"
+    plan.write_text("tasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n    est_minutes: 2\n")
+    assert main(["--repo", str(repo_dir), "plan", str(plan)]) == 0
+    out = capsys.readouterr().out
+    assert "prediction: wall 120 s, cost $0.00, serial share 100% (serial points: t)" in out
+    assert "split hint" not in out                                     # off until the backtest earns it

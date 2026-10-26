@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from .costmodel import error as cm_error, predict, reconstruct_serial_flags
+from .costmodel import backfill_fix_rounds, error as cm_error, predict, reconstruct_serial_flags
 from .graph import ACTIVE, Kind, State, Task, TaskGraph
 from .handoff import (build_context_pack, generate_handoff, interpreter_conflicts, merge_conflict_spec,
                       classify_path, parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
@@ -83,6 +83,7 @@ class Scheduler:
         self._budget_deferred: set[str] = set()
         self._serial_points: set[str] = set()     # tasks every other unfinished task waited for (this run)
         self.prediction: Optional[dict] = None
+        self._fix_round: dict[str, bool] = {}
         self.serial_seconds = 0.0
         self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
         self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
@@ -286,6 +287,8 @@ class Scheduler:
     def _start(self, t: Task) -> None:
         if self._is_global_serial_point(t):
             self._serial_points.add(t.id)
+        # completed before (a change round, or reopened by a REJECT); a retry has no handoff yet
+        self._fix_round[t.id] = self.store.latest_handoff(t.id) is not None
         t.attempts += 1
         t.state = State.RUNNING.value
         t.preempt = False
@@ -377,7 +380,7 @@ class Scheduler:
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
                              est_minutes=t.est_minutes, kind=t.kind, serial=tid in self._serial_points,
-                             **self._predicted_for(tid))
+                             fix_round=self._fix_round.get(tid), **self._predicted_for(tid))
 
         if res.preempted or t.preempt:
             t.attempts = max(0, t.attempts - 1)       # a preempted run is not a failed attempt
@@ -784,7 +787,9 @@ class Scheduler:
         self.emit("run_started", None, tasks=len(self.graph.tasks), max_parallel=self.cfg.max_parallel)
         try:
             reconstruct_serial_flags(self.store)
-            self.prediction = predict(self.graph, self.store, max_parallel=self.cfg.max_parallel)
+            backfill_fix_rounds(self.store)
+            self.prediction = predict(self.graph, self.store, max_parallel=self.cfg.max_parallel,
+                                      review_tiering=self.cfg.review_tiering, low_model=self.cfg.review_low_model)
             self.emit("prediction", None, **{k: v for k, v in self.prediction.items() if k != "per_task"})
         except Exception as e:                  # the model only reports; it must never stop a run
             self.prediction = None

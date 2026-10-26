@@ -106,3 +106,46 @@ async def test_run_records_prediction_flags_and_reconstruction_agrees(repo):
     store._conn.execute("UPDATE usage SET serial = NULL")
     assert reconstruct_serial_flags(store) == 5
     assert {r["task_id"]: r["serial"] for r in store._conn.execute("SELECT * FROM usage")} == live
+
+
+def test_backfill_fix_rounds(tmp_path):
+    from macc.costmodel import backfill_fix_rounds
+    store = Store(tmp_path / "s.db")
+    for tid, attempt in [("a", 1), ("a", 2), ("b", 1), ("a", 1), ("b", 1), ("a", 2)]:
+        store.add_usage(tid, attempt, "claude", True, model="m", kind="code")
+    assert backfill_fix_rounds(store) == 6
+    flags = [r["fix_round"] for r in store._conn.execute("SELECT fix_round FROM usage ORDER BY id")]
+    #        a1 first  a2 retry  b1 first  a1 later round  b1 later round  a2 retry in that round
+    assert flags == [0, 0, 0, 1, 1, 1]
+
+
+def test_fix_round_review_is_predicted_on_the_low_tier(tmp_path):
+    store = Store(tmp_path / "s.db")
+    for _ in range(3):
+        store.add_usage("old_r", 1, "claude", True, model="claude-opus-5-5", kind="review", seconds=150,
+                        cost_usd=1.0, serial=True, fix_round=False)
+        store.add_usage("old_r", 1, "claude", True, model="claude-sonnet-5-5", kind="review", seconds=40,
+                        cost_usd=0.2, serial=True, fix_round=True)
+    g = TaskGraph([Task("r", "r", kind=Kind.REVIEW.value, model="opus")])
+    first = predict(g, store, gates=False)["per_task"]["r"]
+    assert (first["seconds"], first["cost"], first["model"], first["fix_round"]) == (150, 1.0, "opus", False)
+    store.save_handoff("r", 1, "h", "o", {"notes_for_downstream": "VERDICT: APPROVE"})        # it ran before
+    fix = predict(g, store, gates=False)["per_task"]["r"]
+    assert (fix["seconds"], fix["cost"], fix["model"], fix["fix_round"]) == (40, 0.2, "sonnet", True)
+    assert "review/sonnet/fix round as serial point (n=3)" == fix["source"]
+    off = predict(g, store, gates=False, review_tiering=False)["per_task"]["r"]
+    assert off["model"] == "opus" and off["seconds"] == 150                    # no opus fix rows: opus level
+
+
+async def test_run_records_fix_round_live(repo):
+    store = Store(repo.macc_dir / "state.db")
+    g = diamond()
+    g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"], skip_noop_integrate=False)
+    await Scheduler(repo, store, g, MockWorker(), cfg).run()
+    n_first = store._conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0]
+    g.update_spec("a", g.tasks["a"].spec + " (changed)")
+    await Scheduler(repo, store, g, MockWorker(), cfg).run()
+    rows = store._conn.execute("SELECT id, task_id, fix_round FROM usage ORDER BY id").fetchall()
+    assert all(r["fix_round"] == 0 for r in rows[:n_first])
+    assert {r["task_id"]: r["fix_round"] for r in rows[n_first:]} == {"a": 1, "i": 1, "r": 1}

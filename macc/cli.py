@@ -69,10 +69,12 @@ def cmd_init(a) -> int:
 
 def _prediction_lines(g, store: Store, cfg: dict) -> list[str]:
     """The cost model's numbers for a plan (and split hints only when enabled in config)."""
-    from .costmodel import describe, predict, reconstruct_serial_flags, split_hints
+    from .costmodel import backfill_fix_rounds, describe, predict, reconstruct_serial_flags, split_hints
     try:
         reconstruct_serial_flags(store)
-        pred = predict(g, store, max_parallel=int(cfg.get("max_parallel", 4)))
+        backfill_fix_rounds(store)
+        pred = predict(g, store, max_parallel=int(cfg.get("max_parallel", 4)),
+                       review_tiering=cfg.get("review_tiering", True), low_model=cfg.get("review_low_model", "sonnet"))
     except Exception as e:                      # never block planning on the model
         return [f"prediction unavailable: {e!r}"[:200]]
     lines = [describe(pred)]

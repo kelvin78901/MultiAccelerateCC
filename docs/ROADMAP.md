@@ -229,8 +229,25 @@ have identifiable causes, not noise: insights' contract ran 1350 s against a 155
 pre-computed-answers contract v0.2.12 now rejects; `serial_bottleneck` is the live signal for it), and fix
 rounds are cheaper than first rounds (watch r2's review 108 s vs 152 s). A later low-tier round (routes C)
 was +267% on cost because the model does not yet know the review tier (sonnet $0.21 vs the opus-dominated
-review median). **Split hints stay off** (`split_hints: false`) until the error is within 30%; next
-model inputs: review tier (model-specific medians) and first round vs fix round.
+review median). **Split hints stay off** (`split_hints: false`) until the error is within 30%.
+
+v0.3.6 adds those two inputs: history is looked up by kind / model family / first-vs-fix round / serial
+point (falling back level by level until >= 3 samples), a fix round is a task that completed before
+(`usage.fix_round`, recorded at dispatch, reconstructed from done events for older rows), and with
+tiering on a fix-round review is predicted on the low-tier model. Backtest again (leave-one-out):
+
+| history | runs within 30% (wall and cost) | mean wall error | mean cost error | mean serial error |
+|---|---|---|---|---|
+| v0.3.5 model, AutoLeaseRank only | 2 / 4 | 32% | 18% | 8 pt |
+| v0.3.6 model, AutoLeaseRank only | 2 / 4 | 33% | 18% | 8 pt |
+| v0.3.6 model, AutoLeaseRank + macc-smoke | **3 / 4** | **31%** | **14%** | 7 pt |
+
+The new dimensions are right but starved: AutoLeaseRank has 5 fix-round rows and 2 sonnet reviews, so
+under leave-one-out most lookups fall back past them. Pooling the macc-smoke history (5 fix-round opus
+reviews, 9 fix-round code runs) brings watch r2 from +41% / +55% to +29% / −18%. The remaining wall error
+is almost all insights (−72%, the 1350 s contract that v0.2.12 now rejects); without it the three other
+runs average 18%. Hints stay off until that is decided; low-tier (sonnet) review samples are still
+missing everywhere (routes C, +91% wall).
 
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus

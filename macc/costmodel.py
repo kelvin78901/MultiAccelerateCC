@@ -62,6 +62,8 @@ def reconstruct_serial_flags(store: Store) -> int:
     graph = store.load_graph()
     events = [dict(r) for r in conn.execute("SELECT seq, type, task_id, payload FROM events ORDER BY seq")]
     flags: dict[tuple[str, int], list[int]] = {}
+    fixes: dict[tuple[str, int], list[int]] = {}   # same keys: had the task completed before this dispatch?
+    completed: set[str] = set()                     # across runs
     run: list = []
     for ev in events + [{"seq": None, "type": "run_started", "task_id": None, "payload": None}]:
         if ev["type"] == "run_started" and run:
@@ -70,45 +72,70 @@ def reconstruct_serial_flags(store: Store) -> int:
             finished: set[str] = set()
             for e in run:
                 tid = e["task_id"]
-                if tid not in graph.tasks:
-                    continue
-                if e["type"] == "dispatched":
+                if e["type"] == "dispatched" and tid:
                     attempt = json.loads(e["payload"] or "{}").get("attempt", 1)
-                    later = graph.descendants(tid)
-                    flags.setdefault((tid, attempt), []).append(int(touched - finished - {tid} <= later))
-                elif e["type"] in ("done", "revalidated", "integrate_skipped"):
+                    fixes.setdefault((tid, attempt), []).append(int(tid in completed))
+                    if tid in graph.tasks:
+                        later = graph.descendants(tid)
+                        flags.setdefault((tid, attempt), []).append(int(touched - finished - {tid} <= later))
+                elif e["type"] in ("done", "revalidated", "integrate_skipped") and tid:
                     finished.add(tid)
+                    completed.add(tid)
             run = []
         if ev["type"] != "run_started" or ev["seq"] is not None:
             run.append(ev)
     updated = 0
     seen: dict[tuple[str, int], int] = {}
     rows = conn.execute("SELECT id, task_id, attempt FROM usage WHERE worker NOT LIKE '%:merge' "
-                        "AND task_id IN (SELECT id FROM tasks) ORDER BY id").fetchall()
+                        "ORDER BY id").fetchall()
     for r in rows:
         key = (r["task_id"], r["attempt"])
         i = seen.get(key, 0)
         seen[key] = i + 1
-        vals = flags.get(key, [])
+        vals, fx = flags.get(key, []), fixes.get(key, [])
         if i < len(vals):
-            cur = conn.execute("UPDATE usage SET serial=? WHERE id=? AND serial IS NULL", (vals[i], r["id"]))
-            updated += cur.rowcount
+            updated += conn.execute("UPDATE usage SET serial=? WHERE id=? AND serial IS NULL",
+                                    (vals[i], r["id"])).rowcount
+        if i < len(fx):
+            conn.execute("UPDATE usage SET fix_round=? WHERE id=? AND fix_round IS NULL", (fx[i], r["id"]))
     return updated
 
 
-def history(store: Store, exclude_ids: Iterable[int] = ()) -> dict[str, dict[str, list[float]]]:
-    """Per kind: seconds of every worker run, seconds of the runs that were serial points, costs."""
+def model_family(model: Optional[str]) -> Optional[str]:
+    """'opus' / 'sonnet' / 'haiku' from a CLI model id or alias (claude-opus-5-5, opus, ...)."""
+    m = (model or "").lower()
+    return next((f for f in ("opus", "sonnet", "haiku") if f in m), m or None)
+
+
+def backfill_fix_rounds(store: Store) -> int:
+    """Fallback for rows reconstruct_serial_flags could not match to a dispatch event: a row is a fix round
+    if an earlier row of the same task has an attempt number >= its own (attempts restart when a task is
+    re-run in a later round; a retry inside a round has a higher attempt number than the rows before it)."""
+    conn = store._conn
+    rows = conn.execute("SELECT id, task_id, attempt, fix_round FROM usage WHERE worker NOT LIKE '%:merge' "
+                        "ORDER BY id").fetchall()
+    seen: dict[str, list[int]] = {}
+    updated = 0
+    for r in rows:
+        prev = seen.setdefault(r["task_id"], [])
+        if r["fix_round"] is None:
+            fix = int(any(a >= r["attempt"] for a in prev))
+            updated += conn.execute("UPDATE usage SET fix_round=? WHERE id=?", (fix, r["id"])).rowcount
+        prev.append(r["attempt"])
+    return updated
+
+
+def history(store: Store, exclude_ids: Iterable[int] = ()) -> list[dict]:
+    """Every worker run that can calibrate the model: kind, model family, fix round, serial, seconds, cost."""
     excl = set(exclude_ids)
-    out: dict[str, dict[str, list[float]]] = {}
-    for r in store._conn.execute("SELECT id, kind, seconds, cost_usd, serial FROM usage WHERE model IS NOT NULL "
-                                 "AND kind IS NOT NULL AND kind != 'plan' AND worker NOT LIKE '%:merge'"):
+    out = []
+    for r in store._conn.execute("SELECT id, kind, model, seconds, cost_usd, serial, fix_round FROM usage "
+                                 "WHERE model IS NOT NULL AND kind IS NOT NULL AND kind != 'plan' "
+                                 "AND worker NOT LIKE '%:merge'"):
         if r["id"] in excl:
             continue
-        h = out.setdefault(r["kind"], {"seconds": [], "serial_seconds": [], "cost": []})
-        h["seconds"].append(r["seconds"])
-        h["cost"].append(r["cost_usd"])
-        if r["serial"] == 1:
-            h["serial_seconds"].append(r["seconds"])
+        out.append({"kind": r["kind"], "family": model_family(r["model"]), "fix": r["fix_round"] == 1,
+                    "serial": r["serial"] == 1, "seconds": r["seconds"], "cost": r["cost_usd"]})
     return out
 
 
@@ -119,39 +146,58 @@ def full_gate_seconds(store: Store, exclude_seq: Iterable[int] = ()) -> Optional
     return statistics.median(xs) if xs else None
 
 
-def _estimate(kind: str, serial: bool, hist: dict, est_minutes: float) -> tuple[float, float, str]:
-    h = hist.get(kind, {})
-    everything = [x for v in hist.values() for x in v["seconds"]]
-    all_cost = [x for v in hist.values() for x in v["cost"]]
-    if serial and len(h.get("serial_seconds", [])) >= MIN_SAMPLES:
-        secs, src = statistics.median(h["serial_seconds"]), f"{kind} as serial point (n={len(h['serial_seconds'])})"
-    elif len(h.get("seconds", [])) >= MIN_SAMPLES:
-        secs, src = statistics.median(h["seconds"]), f"{kind} (n={len(h['seconds'])})"
-    elif everything:
-        secs, src = statistics.median(everything), f"all kinds (n={len(everything)})"
-    else:
-        secs, src = est_minutes * 60, "plan estimate (no history)"
-    cost = statistics.median(h["cost"]) if len(h.get("cost", [])) >= MIN_SAMPLES else \
-        (statistics.median(all_cost) if all_cost else 0.0)
-    return secs, cost, src
+def _pick(rows: list[dict], levels: list[tuple[str, dict]], field: str) -> Optional[tuple[float, str]]:
+    """Median of `field` over the first level (name, filter) with at least MIN_SAMPLES rows."""
+    for name, flt in levels:
+        xs = [r[field] for r in rows if all(r[k] == v for k, v in flt.items())]
+        if len(xs) >= MIN_SAMPLES:
+            return statistics.median(xs), f"{name} (n={len(xs)})"
+    return None
+
+
+def _estimate(kind: str, family: Optional[str], fix: bool, serial: bool, rows: list[dict],
+              est_minutes: float) -> tuple[float, float, str]:
+    rnd = "fix round" if fix else "first round"
+    ser = {"serial": True} if serial else {}
+    sname = " as serial point" if serial else ""
+    levels = [(f"{kind}/{family}/{rnd}{sname}", {"kind": kind, "family": family, "fix": fix, **ser}),
+              (f"{kind}/{family}{sname}", {"kind": kind, "family": family, **ser}),
+              (f"{kind}/{rnd}{sname}", {"kind": kind, "fix": fix, **ser}),
+              (f"{kind}{sname}", {"kind": kind, **ser}), (kind, {"kind": kind}), ("all kinds", {})]
+    got = _pick(rows, levels, "seconds")
+    secs, src = got if got else (est_minutes * 60, "plan estimate (no history)")
+    cost_levels = [(n, {k: v for k, v in f.items() if k != "serial"}) for n, f in levels]
+    c = _pick(rows, cost_levels, "cost")
+    return secs, (c[0] if c else 0.0), src
 
 
 # ---------------------------------------------------------------------------- predict
 def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_parallel: int = 4,
             exclude_usage: Iterable[int] = (), exclude_gate_seq: Iterable[int] = (),
-            gates: bool = True) -> dict:
+            gates: bool = True, review_tiering: bool = True, low_model: str = "sonnet",
+            fix_rounds: Optional[set[str]] = None) -> dict:
     """Prediction for running `ids` (default: every task not DONE/CANCELLED). A STALE task with gates that
-    is not a review is expected to revalidate (no worker, no time)."""
+    is not a review is expected to revalidate (no worker, no time). A task is a fix round if it completed
+    before (`fix_rounds`, default: it has a handoff). With review tiering on, a fix-round review is
+    predicted on the low-tier model (fix rounds are small changes), a first-round review on its planned one."""
     if ids is None:
         ids = {t.id for t in graph.tasks.values() if t.state not in (State.DONE.value, State.CANCELLED.value)}
     workers = {t for t in ids if not (graph.tasks[t].state == State.STALE.value and graph.tasks[t].done_when
                                       and graph.tasks[t].kind != Kind.REVIEW.value)}
-    hist = history(store, exclude_usage)
+    rows = history(store, exclude_usage)
     serial = static_serial_points(graph, workers)
+    if fix_rounds is None:
+        fix_rounds = {t for t in workers if store.latest_handoff(t) is not None}
     per: dict[str, dict] = {}
     for t in workers:
-        secs, cost, src = _estimate(graph.tasks[t].kind, t in serial, hist, graph.tasks[t].est_minutes)
-        per[t] = {"seconds": round(secs, 1), "cost": round(cost, 4), "serial": t in serial, "source": src}
+        task = graph.tasks[t]
+        fix = t in fix_rounds
+        family = model_family(task.model)
+        if task.kind == Kind.REVIEW.value and review_tiering and fix:
+            family = model_family(low_model)
+        secs, cost, src = _estimate(task.kind, family, fix, t in serial, rows, task.est_minutes)
+        per[t] = {"seconds": round(secs, 1), "cost": round(cost, 4), "serial": t in serial, "fix_round": fix,
+                  "model": family, "source": src}
     dur = {t: per[t]["seconds"] for t in workers}
     phase_times = []
     for _, group in sorted(_phases(graph, workers, serial).items()):

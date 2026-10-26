@@ -1,0 +1,88 @@
+# Example plan: a small web feature split so front-end, back-end, tests and infra run in parallel.
+# Everything that shares an interface depends on the `contract` task; that is what makes the
+# fan-out safe. Ownership globs keep workers out of each other's files.
+
+config:
+  max_parallel: 4
+  token_budget: 600000
+  integration_gates:
+    - "python -m pytest -q"
+
+defaults:
+  effort: medium
+  max_attempts: 2
+
+tasks:
+  - id: contract
+    title: API contract and test plan
+    kind: contract
+    effort: high
+    owns: ["api/openapi.yaml", "docs/testplan.md"]
+    est_minutes: 10
+    est_tokens: 40000
+    done_when: ["test -f api/openapi.yaml"]
+    spec: |
+      Define the OpenAPI schema for a todo service: list, create, toggle, delete.
+      Include error responses. Write docs/testplan.md listing the e2e cases.
+
+  - id: backend
+    title: Backend implementation
+    deps: [contract]
+    owns: ["server/**"]
+    est_minutes: 40
+    est_tokens: 120000
+    done_when: ["python -m pytest server -q"]
+    spec: |
+      Implement the API from api/openapi.yaml with FastAPI + SQLite in server/.
+      Unit tests in server/tests. Do not touch web/ or e2e/.
+
+  - id: frontend
+    title: Frontend implementation
+    deps: [contract]
+    owns: ["web/**"]
+    est_minutes: 30
+    est_tokens: 100000
+    allow_stubs: true
+    spec: |
+      Build a single-page UI in web/ against api/openapi.yaml. Use a mock server
+      (msw or a tiny JSON stub) so the UI runs before the backend exists. Mark stubs TODO(macc).
+
+  - id: e2e
+    title: End-to-end tests
+    deps: [contract]
+    owns: ["e2e/**"]
+    est_minutes: 20
+    est_tokens: 60000
+    spec: |
+      Write Playwright e2e tests in e2e/ following docs/testplan.md. They may be skipped
+      with a marker until integrate runs.
+
+  - id: infra
+    title: Dev environment
+    owns: ["infra/**", "Dockerfile", "docker-compose.yml"]
+    est_minutes: 15
+    est_tokens: 40000
+    spec: |
+      Dockerfile + compose for server and web. A `make up` target. No app code.
+
+  - id: integrate
+    title: Integrate and run e2e
+    kind: integrate
+    deps: [backend, frontend, e2e, infra]
+    effort: high
+    est_minutes: 20
+    est_tokens: 80000
+    done_when: ["python -m pytest -q"]
+    spec: |
+      Wire web/ to the real server, remove the frontend mock, un-skip the e2e tests, make them pass.
+      Resolve every open debt listed in your context or explain in open_questions why it must stay.
+
+  - id: review
+    title: Independent review
+    kind: review
+    deps: [integrate]
+    effort: high
+    est_minutes: 10
+    est_tokens: 50000
+    spec: |
+      Review the full diff of the integration branch against main. Verdict APPROVE or REJECT.

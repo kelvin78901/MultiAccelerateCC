@@ -76,3 +76,13 @@ async def test_reviewer_may_run_gate_commands(tmp_path, monkeypatch):
     args = args_file.read_text()
     assert "Bash(python -m pytest:*)" in args and "Bash(ruff:*)" in args and "Bash(bash scripts/check.sh:*)" in args
     assert "Edit" not in args.split("--allowedTools")[1].split()[0]
+
+
+async def test_code_worker_gets_full_toolkit(tmp_path, monkeypatch):
+    fake = make_fake(tmp_path)
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("FAKE_ARGS_FILE", str(args_file))
+    wt = tmp_path / "wt"; wt.mkdir()
+    await ClaudeWorker(binary=str(fake))(Task("c", "c", owns=["x/**"]), wt, "p")
+    allowed = args_file.read_text().split("--allowedTools")[1].split()[0]
+    assert "Bash" in allowed.split(",") and "Edit" in allowed.split(",")

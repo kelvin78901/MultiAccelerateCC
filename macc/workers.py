@@ -78,6 +78,10 @@ class ClaudeWorker:
                         prefix = head[0]                     # ruff / pytest / tsc
                     allowed.append(f"Bash({prefix}:*)")
             cmd += ["--allowedTools", ",".join(dict.fromkeys(allowed))]
+        else:
+            # headless mode denies anything not pre-allowed; workers need the full kit.
+            # Ownership is enforced by the PreToolUse guard, not by withholding tools.
+            cmd += ["--allowedTools", "Read,Edit,Write,MultiEdit,NotebookEdit,Grep,Glob,Bash,WebFetch"]
         cmd += self.extra_args
         return cmd
 

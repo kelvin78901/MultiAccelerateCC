@@ -9,8 +9,10 @@ from macc.workers import ClaudeWorker
 
 FAKE = """#!/usr/bin/env bash
 # fake claude: echo a JSON result like `claude -p --output-format json`
-prompt=$(cat)
+# prompt is argv[2] when given positionally (claude -p "<prompt>" ...), else stdin
+if [[ "$1" == "-p" && "$2" != --* ]]; then prompt="$2"; shift 2; else shift 1; prompt=$(cat); fi
 args="$*"
+if [[ -n "$FAKE_TRANSIENT" ]]; then echo "Error: no stdin data received in 3s" >&2; exit 1; fi
 if [[ "$args" == *"--effort"* && -n "$FAKE_REJECT_EFFORT" ]]; then
   echo "error: unknown option '--effort'" >&2; exit 1
 fi
@@ -86,3 +88,12 @@ async def test_code_worker_gets_full_toolkit(tmp_path, monkeypatch):
     await ClaudeWorker(binary=str(fake))(Task("c", "c", owns=["x/**"]), wt, "p")
     allowed = args_file.read_text().split("--allowedTools")[1].split()[0]
     assert "Bash" in allowed.split(",") and "Edit" in allowed.split(",")
+
+
+async def test_transient_failure_detected(tmp_path, monkeypatch):
+    fake = make_fake(tmp_path)
+    monkeypatch.setenv("FAKE_ARGS_FILE", str(tmp_path / "a.txt"))
+    monkeypatch.setenv("FAKE_TRANSIENT", "1")
+    wt = tmp_path / "wt"; wt.mkdir()
+    res = await ClaudeWorker(binary=str(fake))(Task("c", "c"), wt, "p")
+    assert not res.ok and res.transient

@@ -157,6 +157,14 @@ class Scheduler:
             self._cleanup(tid)
             return
 
+        if not res.ok and res.transient and t.attempts <= t.max_attempts + 2:
+            # infrastructure hiccup (CLI start, stdin race, rate limit): not the task's fault
+            t.attempts = max(0, t.attempts - 1)
+            t.state = State.PENDING.value
+            self._persist(tid)
+            self.emit("transient_failure", tid, error=(res.error or "")[:300])
+            self._cleanup(tid)
+            return
         if not res.ok:
             self._fail(t, res.error or "worker reported failure")
             self._cleanup(tid)

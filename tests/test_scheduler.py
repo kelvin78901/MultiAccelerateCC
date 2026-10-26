@@ -330,3 +330,10 @@ async def test_out_of_scope_write_dropped_when_lenient(repo):
     s, store, g, worker, events, summary = await run(repo, tasks, strict_ownership=False)
     assert g.tasks["t"].state == State.FAILED.value          # nothing in scope was committed -> "no changes"
     assert ("ownership_violation", "t") in events
+
+
+async def test_transient_failure_not_charged(repo):
+    tasks = [Task("t", "t", owns=["a/**"], spec="mock:transient_first", max_attempts=1)]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    assert g.tasks["t"].state == State.DONE.value and g.tasks["t"].attempts == 1
+    assert ("transient_failure", "t") in events and worker.calls.count("t") == 2

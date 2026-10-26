@@ -31,6 +31,7 @@ class WorkerResult:
     seconds: float = 0.0
     error: Optional[str] = None
     preempted: bool = False
+    transient: bool = False        # infrastructure failure (CLI did not start, no stdin, rate limit): do not charge
 
 
 WorkerFn = Callable[[Task, Path, str], Awaitable[WorkerResult]]
@@ -54,8 +55,15 @@ class ClaudeWorker:
     def available(self) -> bool:
         return shutil.which(self.binary) is not None
 
-    def _cmd(self, task: Task) -> list[str]:
-        cmd = [self.binary, "-p", "--output-format", "json", "--permission-mode", self.permission_mode]
+    ARGV_PROMPT_LIMIT = 100_000     # bytes; larger prompts go through stdin
+    TRANSIENT_MARKERS = ("no stdin data", "Input must be provided", "rate limit", "overloaded",
+                         "529", "ECONNRESET", "ETIMEDOUT", "fetch failed")
+
+    def _cmd(self, task: Task, prompt_in_argv: Optional[str] = None) -> list[str]:
+        cmd = [self.binary, "-p"]
+        if prompt_in_argv is not None:
+            cmd.append(prompt_in_argv)
+        cmd += ["--output-format", "json", "--permission-mode", self.permission_mode]
         model = task.model or self.default_model
         if model:
             cmd += ["--model", model]
@@ -105,7 +113,9 @@ class ClaudeWorker:
         env.pop("CLAUDECODE", None)  # allow nested invocation from inside a Claude session
         env["MACC_OWNS"] = "|".join(task.owns)
         env["MACC_TASK"] = task.id
-        cmd = self._cmd(task)
+        # the CLI gives stdin only ~3 s; under load that races. Prefer argv for normal-sized prompts.
+        use_argv = len(context_pack.encode()) <= self.ARGV_PROMPT_LIMIT
+        cmd = self._cmd(task, context_pack if use_argv else None)
         for flag in ClaudeWorker._dropped_flags:
             if flag in cmd:
                 i = cmd.index(flag)
@@ -115,7 +125,8 @@ class ClaudeWorker:
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(context_pack.encode()), timeout=self.timeout)
+            out, err = await asyncio.wait_for(proc.communicate(None if use_argv else context_pack.encode()),
+                                              timeout=self.timeout)
         except asyncio.TimeoutError:
             proc.kill()
             return WorkerResult(ok=False, error="timeout", seconds=time.time() - t0)
@@ -124,11 +135,14 @@ class ClaudeWorker:
             return WorkerResult(ok=False, error="preempted", preempted=True, seconds=time.time() - t0)
         secs = time.time() - t0
         text = out.decode(errors="replace")
+        err_text = err.decode(errors="replace")
+        transient = proc.returncode != 0 and any(m.lower() in (err_text + text).lower() for m in self.TRANSIENT_MARKERS)
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             return WorkerResult(ok=proc.returncode == 0, output_text=text, fields=parse_worker_output(text),
-                                seconds=secs, error=None if proc.returncode == 0 else err.decode(errors="replace")[-2000:])
+                                seconds=secs, transient=transient,
+                                error=None if proc.returncode == 0 else err_text[-2000:])
         result_text = data.get("result", "") if isinstance(data, dict) else ""
         usage = data.get("usage", {}) if isinstance(data, dict) else {}
         return WorkerResult(
@@ -141,7 +155,8 @@ class ClaudeWorker:
             cache_read_tokens=int(usage.get("cache_read_input_tokens", 0)),
             cost_usd=float(data.get("total_cost_usd", 0.0)),
             seconds=secs,
-            error=None if proc.returncode == 0 else err.decode(errors="replace")[-2000:],
+            transient=transient,
+            error=None if proc.returncode == 0 else err_text[-2000:],
         )
 
 
@@ -193,6 +208,8 @@ class MockWorker:
             text = f"merged\n{HANDOFF_BEGIN}\n{json.dumps({'open_questions': '', 'notes_for_downstream': 'resolved', 'stubs': []})}\n{HANDOFF_END}"
             return WorkerResult(ok=True, output_text=text, fields=parse_worker_output(text), model="mock",
                                 input_tokens=self.tokens, output_tokens=self.tokens // 4, seconds=time.time() - t0)
+        if "mock:transient_first" in task.spec and self.calls.count(task.id) == 1:
+            return WorkerResult(ok=False, error="no stdin data received in 3s", transient=True, seconds=time.time() - t0)
         if "mock:fail_first" in task.spec and task.attempts <= 1:
             return WorkerResult(ok=False, error="mock failure", seconds=time.time() - t0,
                                 input_tokens=self.tokens, output_tokens=self.tokens // 4)

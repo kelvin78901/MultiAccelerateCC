@@ -27,7 +27,11 @@ Inspect the repository (read-only) as needed before planning.
 # Rules for a good plan
 1. Contract first. Anything two tasks must agree on (API schema, data model, module interfaces,
    test plan) is its own task with `kind: contract`, and every task that depends on that interface lists it
-   in `deps`. Contracts are small and precise.
+   in `deps`. Contracts are small and precise: interface signatures, data models, error codes and rules,
+   and a test plan that says WHAT to test (cases, boundaries), never the expected values. Do not ask the
+   contract to compute expected outputs or to hand-design fixture data: it is a serial node that every
+   other task waits for. Test tasks compute expected values themselves; they run in parallel anyway.
+   A contract's est_minutes is at most 8 and its output stays around 10k tokens or less.
 2. Ownership. Every task lists `owns`: path globs it may write. Two tasks that can run at the same time
    must not overlap. Shared files (schemas, migrations, config) belong to exactly one task.
 3. Unknowns become spikes. If something might not work (hardware, a library, performance), add a
@@ -36,12 +40,17 @@ Inspect the repository (read-only) as needed before planning.
    command. Prefer tests that exist or that the task itself creates.
 5. Stubs are allowed only where a task says `allow_stubs: true`; the final `kind: integrate` task
    must resolve all debts. End with a `kind: review` task depending on integrate.
-6. Keep tasks between 10 and 60 estimated minutes; split bigger ones. 4 to 12 tasks total.
+6. est_minutes is expected worker minutes (use the measured history below, not human time). Split a
+   task only when the parts can really run in parallel. 4 to 12 tasks total.
 7. effort: contract/integrate/review `high`; ordinary code `medium`; trivial `low`.
 8. est_tokens is total tokens for the task (typical: contract 40k, code 60k-150k, review 50k).
 9. Tests in parallel, merged in order: a test task may run at the same time as the implementation it
    tests, but must list that implementation task under `merge_after` (NOT `deps`) so its tests are
    merged only once the implementation is in. Otherwise the integration gate fails on the old code.
+9b. Fixture data shared by several test tasks is its own `kind: code` task (`deps: [<contract>]`,
+   owning the fixture files / conftest additions), running in parallel with the implementations. Test
+   tasks list it under `merge_after` together with the implementation they test. The contract only names
+   the fixtures (file paths, fixture names, what they must contain), it does not write them.
 10. Model per task: `model: sonnet` for ordinary code and tests; `model: opus` only for contract,
    integrate and review. Put `model: sonnet` in defaults.
 
@@ -173,6 +182,23 @@ def _glob_hit(path: str, glob: str) -> bool:
     return bool(d) and (path == d or path.startswith(d + "/"))
 
 
+CONTRACT_MAX_MINUTES = 8
+# a contract that pre-computes answers becomes a long serial node (AutoLeaseRank /insights: 22 min of 28)
+_EXPECTED = re.compile(r"\bexpected\s+(?:outputs?|values?|results?|answers?|numbers?)\b"
+                       r"(?!\s+(?:format|shape|schema|type|model)s?\b)", re.I)
+_EXPECTED_OK = re.compile(r"\b(?:not|no|never|don'?t|without|instead of)\b|\btests?\b[^.]{0,30}\b(?:compute|derive|calculate)",
+                          re.I)
+
+
+def asks_for_expected_values(spec: str) -> Optional[str]:
+    """The sentence of a contract spec that asks for expected values, if any (negations and "the tests
+    compute ..." are fine)."""
+    for sentence in re.split(r"(?<=[.;:!?])\s+|\n\s*\n", spec):
+        if _EXPECTED.search(sentence) and not _EXPECTED_OK.search(sentence):
+            return sentence.strip()[:160]
+    return None
+
+
 def validate_plan(data: dict) -> TaskGraph:
     if not isinstance(data, dict) or "tasks" not in data:
         raise PlanError("plan must be a mapping with a `tasks` list")
@@ -193,6 +219,16 @@ def validate_plan(data: dict) -> TaskGraph:
         for b in g.tasks.values():
             if a.id < b.id and g.owns_overlap(a, b) and a.id not in g.ancestors(b.id) and b.id not in g.ancestors(a.id):
                 raise PlanError(f"{a.id} and {b.id} may run concurrently but their `owns` overlap")
+    for t in g.tasks.values():
+        if t.kind != Kind.CONTRACT.value:
+            continue
+        if t.est_minutes > CONTRACT_MAX_MINUTES:
+            raise PlanError(f"contract {t.id}: est_minutes {t.est_minutes} > {CONTRACT_MAX_MINUTES}; a contract is "
+                            "interfaces and rules only (move fixtures and expected values to parallel tasks)")
+        bad = asks_for_expected_values(t.spec)
+        if bad:
+            raise PlanError(f"contract {t.id}: spec asks for expected values ({bad!r}); the contract's test "
+                            "plan says what to test, the test tasks compute expected values")
     code_without_gates = [t.id for t in g.tasks.values() if t.kind == Kind.CODE.value and not t.done_when]
     if code_without_gates:
         raise PlanError(f"code tasks without done_when: {code_without_gates}")

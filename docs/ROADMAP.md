@@ -33,6 +33,12 @@ Graph, store, worktrees, handoffs, scheduler, CLI, mock worker, 32 tests.
       plan could not load); cost reservations use the per-kind historical mean instead of this run's
       average (one $1.81 opus contract made each queued $0.2 sonnet task look like $1.81), and a
       reservation that only waits for running tasks is `budget_deferred`, not a sticky `budget_exceeded`.
+- [x] v0.2.12: slim contracts. Planner rules: a contract is interfaces, models, error codes and a test plan
+      of WHAT to test, never expected values; shared fixtures are their own parallel `code` task that test
+      tasks `merge_after`. `validate_plan` rejects a contract with est_minutes > 8 or a spec asking for
+      expected values (one corrective round). Scheduler: tasks that every other unfinished task waits for
+      are global serial points; `serial_bottleneck` when one runs > 3x its estimate; run summary and
+      `status` report the serial share of wall time.
 
 ### Real-run data (2026-10-26; input for the v0.3 cost model)
 Source: `usage` and `events` in `~/macc-smoke/.macc/state.db` and `AutoLeaseRank/.macc/state.db`.

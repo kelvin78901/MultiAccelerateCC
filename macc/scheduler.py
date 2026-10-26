@@ -67,6 +67,8 @@ class Scheduler:
         self._merged_since_full_gate = False      # per_task policy: the final full gate is still owed
         self.gate_seconds = 0.0                   # wall time spent in post-merge gates this run
         self._budget_deferred: set[str] = set()
+        self._serial_points: set[str] = set()     # tasks every other unfinished task waited for (this run)
+        self.serial_seconds = 0.0
         self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
         self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
         self.backoff: dict[str, float] = {}      # task -> earliest re-dispatch time (transient failures)
@@ -151,7 +153,15 @@ class Scheduler:
             n += 1
         return n
 
+    def _is_global_serial_point(self, t: Task) -> bool:
+        """Every other unfinished task is downstream of t: nothing can run beside it."""
+        later = self.graph.descendants(t.id)
+        return all(u.id in later for u in self.graph.tasks.values()
+                   if u.id != t.id and u.state not in (State.DONE.value, State.CANCELLED.value))
+
     def _start(self, t: Task) -> None:
+        if self._is_global_serial_point(t):
+            self._serial_points.add(t.id)
         t.attempts += 1
         t.state = State.RUNNING.value
         t.preempt = False
@@ -198,6 +208,12 @@ class Scheduler:
         self.cost_used += res.cost_usd
         self.runs_done += 1
         self.run_seconds[tid] = self.run_seconds.get(tid, 0.0) + res.seconds
+        if tid in self._serial_points:
+            self.serial_seconds += res.seconds
+            est_s = t.est_minutes * 60
+            if est_s > 0 and res.seconds > 3 * est_s:
+                self.emit("serial_bottleneck", tid, actual_s=round(res.seconds, 1), est_min=t.est_minutes,
+                          ratio=round(res.seconds / est_s, 1))
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
@@ -595,6 +611,7 @@ class Scheduler:
             self.emit("parked_reset", tid, after=t.merge_after)
             self._cleanup(tid)
         final_gate = self._final_gate()
+        wall = time.time() - t0
         summary = {
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),
@@ -602,7 +619,10 @@ class Scheduler:
             # `cost_usd` alone was ambiguous (it became "since plan load" with the cumulative budget)
             "cost_this_run": round(self.cost_used - self._cost_at_start, 4),
             "cost_since_plan": round(self.cost_used, 4),
-            "seconds": round(time.time() - t0, 2),
+            "seconds": round(wall, 2),
+            # time in which nothing else could run: the number that says where to split next time
+            "serial": {"tasks": sorted(self._serial_points), "seconds": round(self.serial_seconds, 1),
+                       "share": round(self.serial_seconds / wall, 3) if wall > 0 else 0.0},
             "critical_path": self.critical_path_this_run(),
             "gate_policy": self.cfg.gate_policy,
             "gate_seconds": round(self.gate_seconds, 2),

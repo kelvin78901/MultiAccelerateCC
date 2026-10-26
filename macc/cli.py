@@ -216,6 +216,9 @@ def cmd_status(a) -> int:
         ratio = f" (actual/est={cp['actual_over_est']:.3f})" if cp.get("actual_over_est") is not None else ""
         print(f"last run critical path: {' -> '.join(cp['tasks'])}: actual {cp['actual_s']:.0f} s, "
               f"est {cp['est_min']:.0f} min{ratio}")
+    ser = (last or {}).get("payload", {}).get("serial") if last else None
+    if ser and ser.get("tasks"):
+        print(f"last run serial share: {ser['share']:.0%} ({ser['seconds']:.0f} s in {', '.join(ser['tasks'])})")
     for row in store.usage_by_kind():
         est = (f"actual/est={row['est_ratio']:.2f} ({row['est_tasks']} tasks)"
                if row.get("est_ratio") is not None else "actual/est=-")

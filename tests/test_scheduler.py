@@ -693,3 +693,24 @@ async def test_budget_deferral_is_not_a_stop_until_nothing_runs(repo):
     assert "budget_deferred" in types                      # 3rd task waited while two were running
     assert summary["stopped_reason"] == "budget_exceeded"  # then the money really ran out
     assert summary["states"].get("done") == 2
+
+
+async def test_serial_points_share_and_bottleneck(repo):
+    # c is a global serial point (everything waits for it) and overruns its estimate 3x+;
+    # a and b run side by side, so neither is serial; r is the last task and therefore serial
+    tasks = [Task("c", "c", kind=Kind.CONTRACT.value, owns=["api/**"], est_minutes=0.001, spec="mock:sleep=0.3"),
+             Task("a", "a", deps=["c"], owns=["a/**"], est_minutes=1),
+             Task("b", "b", deps=["c"], owns=["b/**"], est_minutes=1),
+             Task("r", "r", kind=Kind.REVIEW.value, deps=["a", "b"], owns=["docs/**"], est_minutes=1)]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=3)
+    ser = summary["serial"]
+    assert ser["tasks"] == ["c", "r"]
+    assert 0.3 <= ser["seconds"] and 0 < ser["share"] <= 1
+    assert ("serial_bottleneck", "c") in events
+    assert ("serial_bottleneck", "r") not in events            # r finished within 3x its estimate
+
+
+async def test_independent_tasks_are_not_serial_points(repo):
+    tasks = [Task("x", "x", owns=["x/**"]), Task("y", "y", owns=["y/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)
+    assert summary["serial"]["tasks"] == [] and summary["serial"]["share"] == 0.0

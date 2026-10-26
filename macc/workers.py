@@ -258,7 +258,7 @@ tasks:
     kind: contract
     owns: ["api/**"]
     effort: high
-    est_minutes: 10
+    est_minutes: 5
     est_tokens: 40000
     done_when: ["test -f api/openapi.yaml"]
     spec: |

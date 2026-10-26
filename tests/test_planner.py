@@ -101,3 +101,30 @@ async def test_generate_plan_prompt_carries_history(tmp_path):
     await generate_plan("feature", tmp_path, Spy(), tmp_path / "p.yaml",
                         history={"code": {"median_seconds": 40.0, "runs": 3}})
     assert "# Measured history in this repo" in seen[0] and "- code: median 40 s" in seen[0]
+
+
+def test_contract_limits_are_enforced():
+    from macc.planner import asks_for_expected_values as asks
+    base = yaml.safe_load(MOCK_PLAN)
+    validate_plan(base)                                            # the mock contract is 5 min, interface-only
+    slow = yaml.safe_load(MOCK_PLAN)
+    slow["tasks"][0]["est_minutes"] = 9
+    with pytest.raises(PlanError, match="est_minutes 9 > 8"):
+        validate_plan(slow)
+    greedy = yaml.safe_load(MOCK_PLAN)
+    greedy["tasks"][0]["spec"] = "Write api/openapi.yaml. CONTRACT.md includes exact expected outputs on the fixtures."
+    with pytest.raises(PlanError, match="asks for expected values"):
+        validate_plan(greedy)
+    # what a slim contract may say
+    for ok in ("The test plan says what to test, not the answers.", "Do not include expected values.",
+               "Tests compute their expected results from the fixtures.", "Document the expected output format."):
+        assert asks(ok) is None, ok
+    for bad in ("Compute the exact expected output on the fixtures.", "Then list the expected values per case."):
+        assert asks(bad), bad
+
+
+def test_planner_prompt_has_slim_contract_and_fixture_rules():
+    from macc.planner import PLANNER_PROMPT
+    assert "never the expected values" in PLANNER_PROMPT and "at most 8" in PLANNER_PROMPT
+    assert "Fixture data shared by several test tasks is its own `kind: code` task" in PLANNER_PROMPT
+    assert "10 and 60 estimated minutes" not in PLANNER_PROMPT

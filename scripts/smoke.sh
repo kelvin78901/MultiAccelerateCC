@@ -38,7 +38,7 @@ cat > plan.yaml <<'EOF'
 config:
   max_parallel: 2
   token_budget: 150000
-  integration_gates: ["bash .macc/gate.sh"]
+  integration_gates: ["bash __GATE__"]
 defaults:
   effort: low
   max_attempts: 2
@@ -71,6 +71,7 @@ tasks:
       Write tests/test_core.py using pytest against the interface in calc/interface.md
       (import from calc.core). Do not implement calc/core.py yourself. Add an empty tests/__init__.py.
 EOF
+sed -i.bak "s#__GATE__#$TARGET/.macc/gate.sh#" plan.yaml && rm -f plan.yaml.bak
 
 $MACC init
 $MACC plan plan.yaml

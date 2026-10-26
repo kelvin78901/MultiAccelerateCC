@@ -12,6 +12,7 @@ time, and runs gates after each merge. Conflicts are *detected* here and
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -83,6 +84,31 @@ class Repo:
 
     def head(self, cwd: Optional[Path] = None) -> str:
         return self.git("rev-parse", "HEAD", cwd=cwd).stdout.strip()
+
+    def default_branch(self) -> Optional[str]:
+        """The repo's mainline: origin/HEAD if set, else `main`, else `master`."""
+        p = self.git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            name = p.stdout.strip().split("/", 1)[-1]
+            if self.branch_exists(name):
+                return name
+        for name in ("main", "master"):
+            if self.branch_exists(name):
+                return name
+        return None
+
+    def macc_env(self) -> dict[str, str]:
+        """Refs that plans use instead of hard-coded hashes (they go stale when the base moves):
+        MACC_INTEGRATION = integration HEAD, MACC_BASE = merge-base(integration, mainline)."""
+        if not self.branch_exists(INTEGRATION_BRANCH):
+            return {}
+        env = {"MACC_INTEGRATION": self.git("rev-parse", INTEGRATION_BRANCH).stdout.strip()}
+        main = self.default_branch()
+        if main:
+            p = self.git("merge-base", INTEGRATION_BRANCH, main, check=False)
+            if p.returncode == 0 and p.stdout.strip():
+                env["MACC_BASE"] = p.stdout.strip()
+        return env
 
     # ---------------------------------------------------------- integration
     @property
@@ -278,10 +304,11 @@ class Repo:
     def run_gates(self, commands: list[str], cwd: Optional[Path] = None, timeout: int = 1800) -> list[dict]:
         """Run deterministic gate commands (tests, lint, type-check). Returns one record per command."""
         results = []
+        env = {**os.environ, **self.macc_env()} if commands else None
         for cmd in commands:
             try:
                 p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.integration_path),
-                                   capture_output=True, text=True, timeout=timeout)
+                                   capture_output=True, text=True, timeout=timeout, env=env)
                 results.append({"cmd": cmd, "ok": p.returncode == 0, "code": p.returncode,
                                 "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]})
             except subprocess.TimeoutExpired:

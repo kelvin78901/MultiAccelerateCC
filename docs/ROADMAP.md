@@ -16,12 +16,18 @@ Graph, store, worktrees, handoffs, scheduler, CLI, mock worker, 32 tests.
       out-of-scope = failure), transient CLI failures not charged, prompt via argv, `merge_after`
       soft ordering (run in parallel, merge in order), review `REOPEN:` line, hash refresh on first
       completion, cumulative cost budget, `macc change --owns/--done-when`.
-- [ ] Real-repo trial on one of Kelvin's projects; collect per-kind usage for the cost model.
+- [x] Real-repo trial (AutoLeaseRank "watches": 9 tasks first-try, 2 → 53 tests, $5.08 incl. planning;
+      review round 1 via `macc change`: 59 tests, $1.05).
+- [x] v0.2.7: `MACC_BASE` / `MACC_INTEGRATION` exported to workers and gates (plans must not hard-code
+      hashes; planner warns on them); `usage.est_minutes` recorded per run and `macc status` shows
+      actual/est per kind; advisory `rules_conflict` event when rules.md and CLAUDE.md disagree on the
+      interpreter path.
 
 ## v0.3 — impact analysis and cost model
 - [ ] Code dependency graph via ast-grep / import scan per language; map files → tasks via `owns`.
 - [ ] Change impact: a changed file invalidates tasks that *read* it, not only those that depend on the task.
-- [ ] Cost model for split/no-split, calibrated from `usage` table (per kind: tokens, seconds, success rate).
+- [ ] Cost model for split/no-split, calibrated from `usage` table (per kind: tokens, seconds, success rate,
+      and `est_minutes` vs actual: the first real run came in far under the planner's estimates).
 - [ ] Dynamic decomposition by a planner call when a task's estimate exceeds a threshold.
 
 ## v0.4 — benchmark harness

@@ -104,6 +104,10 @@ tasks:
     spec: ...
 ```
 
+Never hard-code a commit hash in a spec or `done_when`: the base moves. Every worker and gate gets
+`MACC_BASE` (merge-base of `macc/integration` and the mainline) and `MACC_INTEGRATION` (integration
+HEAD), e.g. `git diff --quiet "$MACC_BASE" -- vendor/`.
+
 ## Roadmap
 
 See `docs/DESIGN.md` for the full design and `docs/ROADMAP.md` for what is next

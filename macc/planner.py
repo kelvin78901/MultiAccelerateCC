@@ -86,7 +86,11 @@ Files currently present:
 
 Existing integration gate (reuse it unless there is a reason not to): {GATE}
 Rules for commands in `done_when` / `integration_gates`:
-- They run via the shell with no templating: write them literally (no `%%`, no `$VAR` you did not set).
+- They run via the shell with no templating: write them literally (no `%%`, no `$VAR` you did not set,
+  except the two below).
+- Never write a commit hash (in a spec or a command): the base moves. Use `$MACC_BASE` (merge-base of
+  the integration branch and mainline: "everything this work changed" is `git diff $MACC_BASE`) and
+  `$MACC_INTEGRATION` (integration HEAD). macc exports both to every worker and gate.
 - Never use a bare `python`/`python3`: it is whatever is first on the operator's PATH. Use the same
   interpreter the existing gate uses, or `python3 -c` only for pure-stdlib checks that need no packages.
 - A task that replaces or extends an existing file must say so explicitly in its spec, name the file,
@@ -116,6 +120,8 @@ BARE_PY = re.compile(r"(?:^|[\s;&|(])python3?(?:\s|$)")
 PURE_STDLIB_USE = re.compile(r"python3?\s+(?:-c\s|-m\s+(?:py_compile|compileall|ast|json\.tool)\b)")
 MODIFY_WORDS = re.compile(r"\b(modify|modifies|extend|extends|replace|replaces|overwrite|overwrites|update|updates|"
                           r"rewrite|rewrites|existing|already exists|refactor|edit|edits|append)\b", re.I)
+# 7-40 hex chars with at least one digit and one a-f letter: a commit-ish, not `1048576` or `deadbeef`
+COMMIT_HASH = re.compile(r"(?<![0-9A-Za-z_])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![0-9A-Za-z_])")
 FOREIGN_VERDICTS = re.compile(r"request(?:ed)?\s+changes|needs?\s+work|LGTM|PASS\b|FAIL\b|ACCEPT\b|DECLINE", re.I)
 
 
@@ -134,6 +140,10 @@ def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: l
                 warns.append(f"{t.id}: done_when uses a bare python interpreter (not a pure-stdlib -c/-m py_compile use): {cmd!r}")
             if "%%" in cmd:
                 warns.append(f"{t.id}: done_when contains '%%' (no formatting is applied; probably a bug): {cmd!r}")
+        hashes = sorted({h for text in [t.spec, *t.done_when] for h in COMMIT_HASH.findall(text)})
+        if hashes:
+            warns.append(f"{t.id}: spec/done_when hard-codes commit hash(es) {hashes[:3]}; they go stale when the "
+                         "base moves. Use $MACC_BASE / $MACC_INTEGRATION")
         if existing_files and t.kind != Kind.INTEGRATE.value:   # integrate owning everything is by design
             for g_ in t.owns:
                 hits = sorted(f for f in existing_files if _glob_hit(f, g_))

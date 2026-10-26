@@ -469,3 +469,36 @@ def test_merge_after_owns_overlap_rejected():
     g = TaskGraph([Task("a", "a", owns=["x/**"]), Task("b", "b", merge_after=["a"], owns=["x/y/**"])])
     with _pt.raises(GraphError, match="overlap"):
         g.validate()
+
+
+async def test_done_when_sees_macc_refs_and_usage_records_estimate(repo):
+    t = Task("a", "a", owns=["a/**"], est_minutes=7,
+             done_when=['test -n "$MACC_BASE" && test -n "$MACC_INTEGRATION"',
+                        'git merge-base --is-ancestor "$MACC_BASE" HEAD'])
+    s, store, g, worker, events, summary = await run(repo, [t])
+    assert summary["finished"], (summary, events)
+    rows = store._conn.execute("SELECT est_minutes FROM usage WHERE task_id='a'").fetchall()
+    assert [r[0] for r in rows] == [7]
+
+
+async def test_rules_conflict_event_is_advisory_and_emitted_once(repo):
+    (repo.root / "CLAUDE.md").write_text("Interpreter: `.venv/bin/python` (never bare python3).\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo.root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "claude md"], cwd=repo.root, check=True)
+    tasks = [Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"])]
+    s, store, g, worker, events, summary = await run(
+        repo, tasks, project_rules="- Interpreter is `/opt/p/.venv/bin/python` (absolute).")
+    assert summary["finished"]                                   # advisory: blocks nothing
+    conflicts = [tid for typ, tid in events if typ == "rules_conflict"]
+    assert len(conflicts) == 1 and conflicts[0] in {"a", "b"}   # once per run, not per task
+    stored = [e for e in store.events(limit=500) if e["type"] == "rules_conflict"]
+    assert len(stored) == 1 and "absolute" in stored[0]["payload"]
+
+
+async def test_no_rules_conflict_when_consistent(repo):
+    (repo.root / "CLAUDE.md").write_text("Interpreter: `/opt/p/.venv/bin/python`.\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo.root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "claude md"], cwd=repo.root, check=True)
+    s, store, g, worker, events, summary = await run(
+        repo, [Task("a", "a", owns=["a/**"])], project_rules="- Interpreter is `/opt/p/.venv/bin/python`.")
+    assert not [e for e in events if e[0] == "rules_conflict"]

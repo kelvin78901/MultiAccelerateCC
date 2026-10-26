@@ -210,8 +210,10 @@ def cmd_status(a) -> int:
     print(f"\nusage: runs={u['runs']} in={u['input_tokens']} out={u['output_tokens']} "
           f"cache_read={u['cache_read_tokens']} cost=${u['cost_usd']:.2f} worker_time={u['seconds']:.0f}s")
     for row in store.usage_by_kind():
+        est = (f"actual/est={row['est_ratio']:.2f} ({row['est_tasks']} tasks)"
+               if row.get("est_ratio") is not None else "actual/est=-")
         print(f"  {row['kind']:<10} runs={row['runs']} avg_tokens={row['avg_tokens']:.0f} "
-              f"avg_s={row['avg_seconds']:.1f} success={row['success_rate']:.2f}")
+              f"avg_s={row['avg_seconds']:.1f} success={row['success_rate']:.2f} {est}")
     return 0
 
 

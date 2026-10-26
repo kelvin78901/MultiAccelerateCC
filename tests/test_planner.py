@@ -62,3 +62,20 @@ def test_plan_warnings():
     assert "contract: owns" not in w2 and "bare python" not in w2
     g.tasks["review"].spec = "Write **Verdict: REQUEST CHANGES** or APPROVE"
     assert "verdict vocabulary" in "\n".join(plan_warnings(g))
+
+
+def test_plan_warnings_flag_commit_hashes():
+    from macc.planner import plan_warnings
+    g = validate_plan(yaml.safe_load(MOCK_PLAN))
+    g.tasks["review"].spec = "Inspect `git diff 776bae5` and the round-2 review at b408ee5c."
+    g.tasks["backend"].done_when = ["git diff --quiet 776bae5 -- alr/adapters"]
+    g.tasks["frontend"].spec = "MAX_BODY = 1048576; color #deadbeef; uuid-ish word facade; use $MACC_BASE"
+    w = "\n".join(plan_warnings(g))
+    assert "review: spec/done_when hard-codes commit hash(es) ['776bae5', 'b408ee5c']" in w
+    assert "backend: spec/done_when hard-codes commit hash(es) ['776bae5']" in w
+    assert "frontend:" not in w                    # digits only, letters only, and $MACC_BASE are fine
+
+
+def test_planner_prompt_mentions_macc_refs():
+    from macc.planner import PLANNER_PROMPT
+    assert "$MACC_BASE" in PLANNER_PROMPT and "$MACC_INTEGRATION" in PLANNER_PROMPT

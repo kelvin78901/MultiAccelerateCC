@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_read_tokens INTEGER DEFAULT 0,
     cost_usd REAL DEFAULT 0,
     seconds REAL DEFAULT 0,
-    ok INTEGER NOT NULL
+    ok INTEGER NOT NULL,
+    est_minutes REAL            -- planner estimate for the task at run time (calibration input)
 );
 """
 
@@ -85,6 +86,12 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(usage)")}
+        if "est_minutes" not in cols:   # state.db created before v0.2.7
+            self._conn.execute("ALTER TABLE usage ADD COLUMN est_minutes REAL")
 
     def close(self) -> None:
         self._conn.close()
@@ -217,12 +224,12 @@ class Store:
     # ----------------------------------------------------------------- usage
     def add_usage(self, task_id: str, attempt: int, worker: str, ok: bool, *, model: Optional[str] = None,
                   input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0,
-                  cost_usd: float = 0.0, seconds: float = 0.0) -> None:
+                  cost_usd: float = 0.0, seconds: float = 0.0, est_minutes: Optional[float] = None) -> None:
         self._conn.execute(
             "INSERT INTO usage(task_id,attempt,worker,model,input_tokens,output_tokens,cache_read_tokens,"
-            "cost_usd,seconds,ok) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "cost_usd,seconds,ok,est_minutes) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, attempt, worker, model, input_tokens, output_tokens, cache_read_tokens,
-             cost_usd, seconds, int(ok)),
+             cost_usd, seconds, int(ok), est_minutes),
         )
 
     def usage_totals(self) -> dict:
@@ -239,5 +246,24 @@ class Store:
             "SELECT t.kind, COUNT(*) runs, AVG(u.input_tokens+u.output_tokens) avg_tokens, "
             "AVG(u.seconds) avg_seconds, AVG(u.ok) success_rate FROM usage u JOIN tasks t ON t.id=u.task_id "
             "GROUP BY t.kind"
+        ).fetchall()
+        out = [dict(r) for r in rows]
+        ratios = {r["kind"]: r for r in self.est_ratio_by_kind()}
+        for r in out:
+            e = ratios.get(r["kind"])
+            r["est_ratio"] = e["ratio"] if e else None
+            r["est_tasks"] = e["tasks"] if e else 0
+        return out
+
+    def est_ratio_by_kind(self) -> list[dict]:
+        """Actual worker minutes / planner est_minutes per task kind. Per task, every attempt (and merge
+        agent run) counts towards the actual time; the estimate counts once. Rows without an estimate
+        (runs recorded before v0.2.7, planner calls) are skipped."""
+        rows = self._conn.execute(
+            "SELECT t.kind, COUNT(*) tasks, SUM(x.actual_min) actual_min, SUM(x.est) est_min, "
+            "SUM(x.actual_min) / SUM(x.est) ratio FROM ("
+            "  SELECT task_id, SUM(seconds) / 60.0 actual_min, MAX(est_minutes) est FROM usage "
+            "  WHERE est_minutes IS NOT NULL AND est_minutes > 0 GROUP BY task_id"
+            ") x JOIN tasks t ON t.id = x.task_id GROUP BY t.kind"
         ).fetchall()
         return [dict(r) for r in rows]

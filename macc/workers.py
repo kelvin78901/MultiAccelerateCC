@@ -51,6 +51,7 @@ class ClaudeWorker:
         self.permission_mode = permission_mode
         self.settings_file = settings_file          # hooks (ownership guard) passed via --settings
         self.gate_commands: list[str] = []          # set by the scheduler; reviewers may run these
+        self.env_provider: Optional[Callable[[], dict]] = None   # set by the scheduler: MACC_BASE etc.
         self.name = "claude"
 
     def available(self) -> bool:
@@ -115,6 +116,8 @@ class ClaudeWorker:
         t0 = time.time()
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow nested invocation from inside a Claude session
+        if self.env_provider:
+            env.update(self.env_provider())
         env["MACC_OWNS"] = "|".join(task.owns)
         env["MACC_TASK"] = task.id
         # the CLI gives stdin only ~3 s; under load that races. Prefer argv for normal-sized prompts.

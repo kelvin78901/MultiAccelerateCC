@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .graph import ACTIVE, Kind, State, Task, TaskGraph
-from .handoff import build_context_pack, generate_handoff, merge_conflict_spec, parse_reopen, parse_verdict
+from .handoff import (build_context_pack, generate_handoff, interpreter_conflicts, merge_conflict_spec,
+                      parse_reopen, parse_verdict)
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -54,6 +55,7 @@ class Scheduler:
         self._on_event = on_event
         self.running: dict[str, asyncio.Task] = {}
         self.parked: dict[str, dict] = {}        # finished workers waiting for merge_after targets
+        self._rules_conflicts_seen: set[str] = set()
         self.backoff: dict[str, float] = {}      # task -> earliest re-dispatch time (transient failures)
         self.tokens_used = 0
         # budget is cumulative over runs of the same plan: start from what was already spent since plan load
@@ -61,6 +63,8 @@ class Scheduler:
         self.runs_done = 0
         if hasattr(worker, "gate_commands"):
             worker.gate_commands = list(self.cfg.integration_gates)
+        if hasattr(worker, "env_provider"):
+            worker.env_provider = self.repo.macc_env
         self.stopped_reason: Optional[str] = None
 
     # ------------------------------------------------------------ plumbing
@@ -127,6 +131,7 @@ class Scheduler:
         t.branch = self.repo.task_branch(t.id)
         wt = self.repo.create_task_worktree(t.id, fresh=True)
         pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules)
+        self._check_rules_conflict(t, wt)
         if t.last_error:
             pack += f"\n# Previous attempt failed\n{t.last_error[-3000:]}\n"
         ctx_dir = self.repo.macc_dir / "context"
@@ -136,6 +141,16 @@ class Scheduler:
         self.emit("dispatched", t.id, attempt=t.attempts, worktree=str(wt))
         fut = asyncio.create_task(self._run_worker(t, wt, pack), name=f"macc:{t.id}")
         self.running[t.id] = fut
+
+    def _check_rules_conflict(self, t: Task, wt: Path) -> None:
+        """Advisory only: the worker still runs. Emitted once per distinct conflict per run."""
+        claude_md = wt / "CLAUDE.md"
+        if not self.cfg.project_rules or not claude_md.exists():
+            return
+        for msg in interpreter_conflicts(self.cfg.project_rules, claude_md.read_text(errors="replace")):
+            if msg not in self._rules_conflicts_seen:
+                self._rules_conflicts_seen.add(msg)
+                self.emit("rules_conflict", t.id, message=msg)
 
     async def _run_worker(self, t: Task, wt: Path, pack: str) -> tuple[str, Path, WorkerResult]:
         try:
@@ -155,7 +170,8 @@ class Scheduler:
         self.runs_done += 1
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
-                             cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
+                             cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
+                             est_minutes=t.est_minutes)
 
         if res.preempted or t.preempt:
             t.attempts = max(0, t.attempts - 1)       # a preempted run is not a failed attempt
@@ -354,7 +370,8 @@ class Scheduler:
         self.cost_used += res.cost_usd
         self.store.add_usage(t.id, t.attempts, self._worker_name() + ":merge", res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
-                             cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
+                             cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
+                             est_minutes=t.est_minutes)
         leftover = self.repo.remaining_conflict_markers(t.id, conflicts) if res.ok else conflicts
         gates_ok = True
         if res.ok and not leftover and t.done_when:

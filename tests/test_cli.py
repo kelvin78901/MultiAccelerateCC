@@ -93,3 +93,15 @@ def test_init_records_gate(repo_dir, capsys):
     cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
     assert cfg["integration_gates"] == ["true", "test -f README.md"]
     assert "gate verified" in capsys.readouterr().out
+
+
+def test_status_shows_estimate_ratio(repo_dir, tmp_path, capsys):
+    plan = tmp_path / "p.yaml"
+    plan.write_text("tasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n    est_minutes: 10\n")
+    r = str(repo_dir)
+    assert main(["--repo", r, "plan", str(plan)]) == 0
+    assert main(["--repo", r, "run", "--worker", "mock", "--gate", "true"]) == 0
+    capsys.readouterr()
+    assert main(["--repo", r, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "actual/est=" in out and "(1 tasks)" in out

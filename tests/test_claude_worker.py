@@ -97,3 +97,18 @@ async def test_transient_failure_detected(tmp_path, monkeypatch):
     wt = tmp_path / "wt"; wt.mkdir()
     res = await ClaudeWorker(binary=str(fake))(Task("c", "c"), wt, "p")
     assert not res.ok and res.transient
+
+
+async def test_claude_worker_exports_env_provider_vars(tmp_path):
+    fake = tmp_path / "claude"
+    fake.write_text('#!/usr/bin/env bash\nenv | grep "^MACC_" | sort > "$PWD/env.txt"\n'
+                    'echo \'{"type":"result","is_error":false,"result":"ok","usage":{}}\'\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    wt = tmp_path / "wt"; wt.mkdir()
+    w = ClaudeWorker(binary=str(fake))
+    w.env_provider = lambda: {"MACC_BASE": "abc1234", "MACC_INTEGRATION": "def5678", "MACC_TASK": "spoofed"}
+    res = await w(Task("t1", "t", owns=["x/**"]), wt, "p")
+    assert res.ok
+    lines = (wt / "env.txt").read_text().splitlines()
+    assert "MACC_BASE=abc1234" in lines and "MACC_INTEGRATION=def5678" in lines
+    assert "MACC_TASK=t1" in lines and "MACC_OWNS=x/**" in lines   # task identity is not overridable

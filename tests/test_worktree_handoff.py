@@ -182,3 +182,39 @@ def test_parse_verdict_accepts_request_changes():
     from macc.handoff import parse_verdict
     assert parse_verdict("**Verdict: REQUEST CHANGES.** needs tests") == "REJECT"
     assert parse_verdict("Verdict: requested changes") == "REJECT"
+
+
+def test_macc_env_exports_base_and_integration_to_gates(repo):
+    main_head = repo.head()
+    ipath = repo.ensure_integration()
+    (ipath / "new.py").write_text("x = 1\n")
+    repo.commit_all(ipath, "work on integration")
+    env = repo.macc_env()
+    assert env == {"MACC_BASE": main_head, "MACC_INTEGRATION": repo.head(ipath)}
+    res = repo.run_gates([f'test "$MACC_BASE" = {main_head} && test "$MACC_INTEGRATION" = {repo.head(ipath)}',
+                          'git diff --name-only "$MACC_BASE" | grep -qx new.py'])
+    assert all(r["ok"] for r in res), res
+
+
+def test_default_branch_master_and_no_integration(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    for cmd in (["git", "init", "-q", "-b", "master"], ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"], ["git", "commit", "-q", "--allow-empty", "-m", "i"]):
+        subprocess.run(cmd, cwd=root, check=True)
+    r = Repo(root)
+    assert r.default_branch() == "master"
+    assert r.macc_env() == {}                      # no integration branch yet: nothing to export
+    r.ensure_integration()
+    assert r.macc_env()["MACC_BASE"] == r.head()
+
+
+def test_interpreter_conflicts():
+    from macc.handoff import interpreter_conflicts as f
+    abs_rules = "Interpreter is `/Users/k/p/.venv/bin/python` (absolute)."
+    assert f(abs_rules, "Interpreter: `.venv/bin/python` (never bare)")            # abs vs rel
+    assert f(abs_rules, "run ./.venv/bin/python -m pytest")                         # ./ is relative
+    assert f(".venv/bin/python -m pytest", "use $HOME/p/.venv/bin/python3")         # rel vs abs
+    assert f(abs_rules, "use ~/p/.venv/bin/python") == []                           # both absolute
+    assert f(".venv/bin/python", ".venv/bin/python") == []                          # both relative
+    assert f(abs_rules, "no interpreter named here") == []

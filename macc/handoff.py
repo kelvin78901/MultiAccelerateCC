@@ -36,6 +36,21 @@ def _is_code_file(path: Optional[str]) -> bool:
     return Path(path).suffix.lower() not in NON_CODE_EXT
 
 
+VENV_PY = re.compile(r"(?<![\w./~$-])(?:\./)?((?:[~/]|\$HOME|\$\{HOME\})[^\s`'\"]*?)?\.venv/bin/python\d*(?:\.\d+)?")
+
+
+def interpreter_conflicts(rules: str, claude_md: str) -> list[str]:
+    """rules.md and the repo's CLAUDE.md both name `.venv/bin/python`, one absolute and one relative.
+    Worktrees have no .venv (it is git-ignored), so the relative one fails there; workers read both."""
+    def kinds(text: str) -> set[str]:
+        return {"absolute" if m.group(1) else "relative" for m in VENV_PY.finditer(text or "")}
+    r, c = kinds(rules), kinds(claude_md)
+    if not r or not c or r == c:
+        return []
+    return [f"rules.md names .venv/bin/python as {'/'.join(sorted(r))}, CLAUDE.md as {'/'.join(sorted(c))}; "
+            "worktrees have no .venv, so use one absolute interpreter path in both"]
+
+
 def parse_verdict(notes: str) -> Optional[str]:
     """APPROVE / REJECT only when stated as a verdict: at the start of a line, optionally after 'VERDICT:'.
     A sentence like 'no reason to reject' does not count."""

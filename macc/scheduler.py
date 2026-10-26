@@ -29,6 +29,7 @@ from .worktree import Repo
 class SchedulerConfig:
     max_parallel: int = 3
     token_budget: Optional[int] = None          # total input+output tokens across all runs
+    cost_budget_usd: Optional[float] = None     # total reported cost (includes cache reads); preferred
     integration_gates: list[str] = field(default_factory=list)   # run after every merge
     project_rules: str = ""                      # short, stable text prepended to every context pack
     keep_worktrees: bool = False
@@ -50,6 +51,9 @@ class Scheduler:
         self._on_event = on_event
         self.running: dict[str, asyncio.Task] = {}
         self.tokens_used = 0
+        self.cost_used = 0.0
+        if hasattr(worker, "gate_commands"):
+            worker.gate_commands = list(self.cfg.integration_gates)
         self.stopped_reason: Optional[str] = None
 
     # ------------------------------------------------------------ plumbing
@@ -72,6 +76,8 @@ class Scheduler:
             return "wip_limit"
         if self.cfg.token_budget is not None and self.tokens_used + t.est_tokens > self.cfg.token_budget:
             return "budget"
+        if self.cfg.cost_budget_usd is not None and self.cost_used >= self.cfg.cost_budget_usd:
+            return "budget"
         conflicts = self.graph.conflicts_with_active(t)
         if conflicts:
             return f"ownership_conflict:{','.join(conflicts)}"
@@ -92,7 +98,8 @@ class Scheduler:
             if why:
                 if why == "budget" and self.stopped_reason is None:
                     self.stopped_reason = "budget_exceeded"
-                    self.emit("budget_exceeded", t.id, used=self.tokens_used, budget=self.cfg.token_budget)
+                    self.emit("budget_exceeded", t.id, tokens=self.tokens_used, cost_usd=round(self.cost_used, 2),
+                              token_budget=self.cfg.token_budget, cost_budget_usd=self.cfg.cost_budget_usd)
                 continue
             self._start(t)
             n += 1
@@ -130,6 +137,7 @@ class Scheduler:
         t = self.graph.tasks[tid]
         self.running.pop(tid, None)
         self.tokens_used += res.input_tokens + res.output_tokens
+        self.cost_used += res.cost_usd
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
@@ -253,6 +261,7 @@ class Scheduler:
         except Exception as e:
             res = WorkerResult(ok=False, error=f"merge worker exception: {e!r}")
         self.tokens_used += res.input_tokens + res.output_tokens
+        self.cost_used += res.cost_usd
         self.store.add_usage(t.id, t.attempts, self._worker_name() + ":merge", res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
@@ -345,6 +354,7 @@ class Scheduler:
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),
             "tokens_used": self.tokens_used,
+            "cost_usd": round(self.cost_used, 4),
             "seconds": round(time.time() - t0, 2),
             "stopped_reason": self.stopped_reason,
             "failed": [t.id for t in self.graph.tasks.values() if t.state == State.FAILED.value],

@@ -106,6 +106,8 @@ def _config(repo: Repo, a) -> SchedulerConfig:
         cfg["max_parallel"] = a.parallel
     if a.budget is not None:
         cfg["token_budget"] = a.budget
+    if a.cost_budget is not None:
+        cfg["cost_budget_usd"] = a.cost_budget
     if a.gate:
         cfg["integration_gates"] = a.gate
     if a.keep_worktrees:
@@ -241,7 +243,8 @@ def main(argv=None) -> int:
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")
     sp.add_argument("--model", default=None)
     sp.add_argument("--parallel", type=int, default=None)
-    sp.add_argument("--budget", type=int, default=None, help="total token budget for this run")
+    sp.add_argument("--budget", type=int, default=None, help="total in+out token budget for this run")
+    sp.add_argument("--cost-budget", type=float, default=None, help="stop dispatching once reported cost (USD) reaches this")
     sp.add_argument("--gate", action="append", help="integration gate command (repeatable)")
     sp.add_argument("--timeout", type=int, default=3600, help="per-worker timeout seconds")
     sp.add_argument("--keep-worktrees", action="store_true")

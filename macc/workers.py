@@ -48,6 +48,7 @@ class ClaudeWorker:
         self.timeout = timeout
         self.permission_mode = permission_mode
         self.settings_file = settings_file          # hooks (ownership guard) passed via --settings
+        self.gate_commands: list[str] = []          # set by the scheduler; reviewers may run these
         self.name = "claude"
 
     def available(self) -> bool:
@@ -63,7 +64,20 @@ class ClaudeWorker:
         if self.settings_file:
             cmd += ["--settings", str(self.settings_file)]
         if task.kind in ("review", "plan"):
-            cmd += ["--allowedTools", "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(find:*)"]
+            allowed = ["Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git status:*)",
+                       "Bash(ls:*)", "Bash(find:*)"]
+            # reviewers must be able to RUN the gates, not just read the code
+            for cmd_line in list(task.done_when) + list(self.gate_commands):
+                head = cmd_line.strip().split()
+                if head:
+                    if head[0] in ("python", "python3", "uv") and len(head) > 2 and head[1] == "-m":
+                        prefix = " ".join(head[:3])          # python -m pytest
+                    elif head[0] in ("bash", "sh", "make", "npm", "npx", "uv", "cargo", "go", "./gradlew"):
+                        prefix = " ".join(head[:2])          # bash script.sh / npm test / make check
+                    else:
+                        prefix = head[0]                     # ruff / pytest / tsc
+                    allowed.append(f"Bash({prefix}:*)")
+            cmd += ["--allowedTools", ",".join(dict.fromkeys(allowed))]
         cmd += self.extra_args
         return cmd
 

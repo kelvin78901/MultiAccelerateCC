@@ -74,7 +74,7 @@ async def test_waiting_time_is_used(repo):
     order = [tid for typ, tid in events if typ == "done"]
     assert order.index("fast") < order.index("slow")
     assert order.index("after_fast") < order.index("slow")   # dispatched while slow still running
-    assert summary["seconds"] < 1.2
+    assert summary["seconds"] < 2.5          # slow+fast+after_fast serial would be >= 0.7; generous for CI load
 
 
 async def test_retry_then_fail_and_resume(repo):

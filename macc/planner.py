@@ -38,16 +38,19 @@ Inspect the repository (read-only) as needed before planning.
 6. Keep tasks between 10 and 60 estimated minutes; split bigger ones. 4 to 12 tasks total.
 7. effort: contract/integrate/review `high`; ordinary code `medium`; trivial `low`.
 8. est_tokens is total tokens for the task (typical: contract 40k, code 60k-150k, review 50k).
+9. Model per task: `model: sonnet` for ordinary code and tests; `model: opus` only for contract,
+   integrate and review. Put `model: sonnet` in defaults.
 
 # Output
 Emit exactly one YAML document between the markers, nothing else after it:
 {BEGIN}
 config:
   max_parallel: <int>
-  token_budget: <int>
+  cost_budget_usd: <float>
   integration_gates: ["<command that runs the whole test suite>"]
 defaults:
   effort: medium
+  model: sonnet
   max_attempts: 2
 tasks:
   - id: <snake_case>

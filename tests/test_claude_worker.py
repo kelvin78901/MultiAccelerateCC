@@ -62,3 +62,17 @@ async def test_claude_worker_drops_effort_flag_on_old_cli(tmp_path, monkeypatch)
     assert res.ok
     assert "--effort" not in args_file.read_text()
     ClaudeWorker._dropped_flags = set()
+
+
+async def test_reviewer_may_run_gate_commands(tmp_path, monkeypatch):
+    fake = make_fake(tmp_path)
+    args_file = tmp_path / "args.txt"
+    monkeypatch.setenv("FAKE_ARGS_FILE", str(args_file))
+    wt = tmp_path / "wt"; wt.mkdir()
+    w = ClaudeWorker(binary=str(fake))
+    w.gate_commands = ["python -m pytest -q", "ruff check ."]
+    t = Task("r", "r", kind="review", done_when=["bash scripts/check.sh --all"])
+    await w(t, wt, "p")
+    args = args_file.read_text()
+    assert "Bash(python -m pytest:*)" in args and "Bash(ruff:*)" in args and "Bash(bash scripts/check.sh:*)" in args
+    assert "Edit" not in args.split("--allowedTools")[1].split()[0]

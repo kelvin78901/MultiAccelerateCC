@@ -134,3 +134,27 @@ def test_stub_detection_ignores_docs(repo, tmp_path):
     t = Task("a", "A", owns=["docs/**", "x.py"])
     h = generate_handoff(repo, t, wa, [], {})
     assert [s["path"] for s in h["stubs_detected"]] == ["x.py"]
+
+
+def test_commit_scoped_filters_artifacts_and_out_of_scope(repo):
+    repo.ensure_integration()
+    wa = repo.create_task_worktree("a")
+    (wa / "srv").mkdir(); (wa / "srv" / "a.py").write_text("x=1\n")
+    (wa / "srv" / "__pycache__").mkdir(); (wa / "srv" / "__pycache__" / "a.cpython-313.pyc").write_bytes(b"\x00")
+    (wa / "web").mkdir(); (wa / "web" / "b.js").write_text("1\n")
+    (wa / "README.md").write_text("changed\n")
+    sc = repo.commit_scoped(wa, "a", ["srv/**"])
+    assert sc.committed and sc.inside == ["srv/a.py"]
+    assert set(sc.outside) == {"web/b.js", "README.md"}
+    assert sc.ignored == ["srv/__pycache__/a.cpython-313.pyc"]
+    assert repo.changed_files(wa) == [("A", "srv/a.py")]
+    assert repo.git("status", "--porcelain", cwd=wa).stdout == ""      # tree left clean
+    assert (wa / "README.md").read_text() == "hello\n"                  # out-of-scope edit reverted
+
+
+def test_commit_scoped_no_owns_means_everything(repo):
+    repo.ensure_integration()
+    wa = repo.create_task_worktree("a")
+    (wa / "z.txt").write_text("z\n")
+    sc = repo.commit_scoped(wa, "a", [])
+    assert sc.committed and sc.inside == ["z.txt"] and not sc.outside

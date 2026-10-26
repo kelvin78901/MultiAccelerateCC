@@ -35,6 +35,7 @@ class SchedulerConfig:
     keep_worktrees: bool = False
     revalidate_stale: bool = True
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
+    strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
 
 
 EventFn = Callable[[str, Optional[str], dict], None]
@@ -161,8 +162,19 @@ class Scheduler:
             self._cleanup(tid)
             return
 
-        # 1. commit the worktree
-        committed = self.repo.commit_all(wt, f"macc({tid}): attempt {t.attempts}")
+        # 1. commit the worktree: only paths the task owns; build artifacts are discarded;
+        #    anything else outside the scope is an ownership violation (Bash bypasses the Edit hook)
+        sc = self.repo.commit_scoped(wt, f"macc({tid}): attempt {t.attempts}", t.owns)
+        committed = sc.committed
+        if sc.ignored:
+            self.emit("artifacts_discarded", tid, paths=sc.ignored[:20])
+        if sc.outside:
+            self.emit("ownership_violation", tid, paths=sc.outside[:20])
+            if self.cfg.strict_ownership:
+                self._fail(t, f"changed files outside ownership {t.owns}: {sc.outside[:10]}. "
+                              "Only modify owned paths; describe other needs in open_questions.")
+                self._cleanup(tid)
+                return
         if not committed and t.kind in (Kind.CODE.value, Kind.CONTRACT.value):
             self._fail(t, "worker produced no changes")
             self._cleanup(tid)

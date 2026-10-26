@@ -264,9 +264,10 @@ async def _conflict_setup(repo, merge_spec=""):
     (repo.root / "shared.txt").write_text("line1\nline2\n")
     subprocess.run(["git", "add", "-A"], cwd=repo.root, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "shared"], cwd=repo.root, check=True)
+    # no ownership declared (= may write anything) is the one way two concurrent tasks can collide
     tasks = [
-        Task("a", "a", owns=["a/**"], spec="mock:sleep=0.1 mock:write=shared.txt " + merge_spec),
-        Task("b", "b", owns=["b/**"], spec="mock:sleep=0.2 mock:write=shared.txt " + merge_spec),
+        Task("a", "a", owns=[], spec="mock:sleep=0.1 mock:write=shared.txt " + merge_spec),
+        Task("b", "b", owns=[], spec="mock:sleep=0.2 mock:write=shared.txt " + merge_spec),
     ]
     return tasks
 
@@ -314,3 +315,18 @@ async def test_spec_change_reruns_node_and_review_but_revalidates_code(repo):
     assert worker.calls.count("other") == 1       # revalidated by its gate, not re-run
     assert worker.calls.count("review") == 2      # reviews always re-run when stale
     assert ("revalidated", "other") in events and ("stale_rerun", "review") in events
+
+
+async def test_out_of_scope_write_fails_attempt(repo):
+    tasks = [Task("t", "t", owns=["a/**"], spec="mock:write=b/evil.txt", max_attempts=1)]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    assert g.tasks["t"].state == State.FAILED.value
+    assert ("ownership_violation", "t") in events
+    assert not (repo.integration_path / "b" / "evil.txt").exists()
+
+
+async def test_out_of_scope_write_dropped_when_lenient(repo):
+    tasks = [Task("t", "t", owns=["a/**"], spec="mock:write=b/evil.txt", max_attempts=1)]
+    s, store, g, worker, events, summary = await run(repo, tasks, strict_ownership=False)
+    assert g.tasks["t"].state == State.FAILED.value          # nothing in scope was committed -> "no changes"
+    assert ("ownership_violation", "t") in events

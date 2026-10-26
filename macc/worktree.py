@@ -25,6 +25,31 @@ class GitError(RuntimeError):
     pass
 
 
+ARTIFACT_PATTERNS = ("__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", "node_modules/",
+                     ".gradle/", "build/", "dist/", ".DS_Store", ".coverage")
+ARTIFACT_SUFFIXES = (".pyc", ".pyo", ".class", ".o", ".log")
+
+
+def _is_artifact(p: str) -> bool:
+    return any(seg in p for seg in ARTIFACT_PATTERNS) or p.endswith(ARTIFACT_SUFFIXES)
+
+
+def _path_in_glob(p: str, g: str) -> bool:
+    import fnmatch
+    if fnmatch.fnmatch(p, g):
+        return True
+    d = g.rstrip("/*")
+    return bool(d) and (p == d or p.startswith(d + "/"))
+
+
+@dataclass
+class ScopedCommit:
+    committed: bool
+    inside: list[str] = field(default_factory=list)
+    outside: list[str] = field(default_factory=list)   # worker changed these although it does not own them
+    ignored: list[str] = field(default_factory=list)   # build artifacts, discarded
+
+
 @dataclass
 class MergeResult:
     ok: bool
@@ -115,6 +140,41 @@ class Repo:
             return False
         self.git("commit", "-q", "-m", message, cwd=path)
         return True
+
+    def dirty_paths(self, path: Path) -> list[str]:
+        """Modified/added/deleted/untracked paths relative to the worktree root."""
+        out = self.git("status", "--porcelain", "--untracked-files=all", cwd=path).stdout
+        paths = []
+        for line in out.splitlines():
+            p = line[3:]
+            if " -> " in p:
+                p = p.split(" -> ", 1)[1]
+            paths.append(p.strip().strip('"'))
+        return paths
+
+    def commit_scoped(self, path: Path, message: str, owns: list[str]) -> "ScopedCommit":
+        """Stage only paths inside `owns` (build artifacts are ignored), commit them, and report
+        what was left outside the scope. An empty `owns` means everything is in scope."""
+        dirty = self.dirty_paths(path)
+        inside, outside, ignored = [], [], []
+        for p in dirty:
+            if _is_artifact(p):
+                ignored.append(p)
+            elif not owns or any(_path_in_glob(p, g) for g in owns):
+                inside.append(p)
+            else:
+                outside.append(p)
+        if inside:
+            self.git("add", "-A", "--", *inside, cwd=path)
+        committed = False
+        if self.git("diff", "--cached", "--quiet", cwd=path, check=False).returncode != 0:
+            self.git("commit", "-q", "-m", message, cwd=path)
+            committed = True
+        if outside or ignored:
+            # leave the tree clean for rebase/merge; nothing of these reaches the integration branch
+            self.git("checkout", "--", ".", cwd=path, check=False)
+            self.git("clean", "-fdq", cwd=path, check=False)
+        return ScopedCommit(committed=committed, inside=inside, outside=outside, ignored=ignored)
 
     # ---------------------------------------------------------------- diffs
     def merge_base(self, path: Path) -> str:

@@ -39,6 +39,7 @@ class SchedulerConfig:
     keep_worktrees: bool = False
     revalidate_stale: bool = True
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
+    skip_noop_integrate: bool = True             # integrate is skipped when gates are green and nothing is open
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
     cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
 
@@ -120,7 +121,55 @@ class Scheduler:
             return by_kind[t.kind]
         return self.cost_used / self.runs_done if self.runs_done else 0.0
 
+    def _integrate_blockers(self, t: Task) -> list[str]:
+        """Reasons an integrate task must really run. Empty list = it would have nothing to do."""
+        reasons = []
+        ancestors = self.graph.ancestors(t.id)
+        debts = [d for d in self.store.open_debts() if d["task_id"] in ancestors or d["task_id"] == t.id]
+        if debts:
+            reasons.append(f"{len(debts)} open debt(s)")
+        asked = [a for a in sorted(ancestors)
+                 if ((self.store.latest_handoff(a) or {}).get("open_questions") or "").strip()]
+        if asked:
+            reasons.append(f"open_questions from {asked}")
+        if not self.cfg.integration_gates:
+            reasons.append("no integration gate to prove the tree is green")
+        return reasons
+
+    def _try_skip_integrate(self, t: Task) -> bool:
+        """A ready integrate task with nothing open and a green tree is pure overhead (AutoLeaseRank refactor:
+        0 files changed, $0.68, 74 s). Prove green with the full suite plus its own done_when on the
+        integration tree; then mark it DONE without a worker."""
+        if not self.cfg.skip_noop_integrate or self._integrate_blockers(t):
+            return False
+        head = self.repo.head(self.repo.integration_path)
+        last = self.store.latest_event("full_gate")
+        reuse = bool(last and last["payload"].get("ok") and last["payload"].get("head") == head)
+        gates = [] if reuse else self.repo.run_gates(self.cfg.integration_gates)
+        if gates:
+            self._record_gates(t.id, gates, full=True)
+        own = self.repo.run_gates(t.done_when) if t.done_when else []
+        if not all(g["ok"] for g in gates + own):
+            return False                      # something to fix: run the integrate worker as planned
+        self._merged_since_full_gate = False
+        note = "skipped: gates green, nothing to integrate"
+        handoff = {"task_id": t.id, "attempt": t.attempts, "files_changed": [], "api_changes": [],
+                   "gates": [{"cmd": g["cmd"], "ok": g["ok"]} for g in gates + own], "gates_passed": True,
+                   "stubs_detected": [], "stubs_declared": [], "open_questions": "",
+                   "notes_for_downstream": note, "skipped": True, "integration_head": head}
+        out_hash = "skipped-" + self.repo.tree(self.repo.integration_path)[:12]
+        self.store.save_handoff(t.id, t.attempts, t.input_hash, out_hash, handoff)
+        changed = self.graph.mark_done(t.id, out_hash)
+        self._persist(t.id, *changed)
+        self.emit("integrate_skipped", t.id, head=head, reused_full_gate=reuse,
+                  gates=[g["cmd"] for g in gates + own], note=note)
+        return True
+
     def _dispatch_ready(self) -> int:
+        # skipping an integrate makes its dependents ready at once: repeat until nothing more is skipped
+        while any(self._try_skip_integrate(t) for t in self.graph.ready()
+                  if t.kind == Kind.INTEGRATE.value and t.id not in self.running):
+            pass
         n = 0
         now = time.time()
         for t in self.graph.ready():

@@ -555,7 +555,8 @@ async def test_gate_policy_full_runs_suite_after_every_merge(repo, tmp_path):
     count, gate = _counting_gate(tmp_path)
     tasks = [Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"]),
              Task("i", "i", kind=Kind.INTEGRATE.value, deps=["a", "b"], owns=["i/**"])]
-    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=gate, gate_policy="full")
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=gate, gate_policy="full",
+                                                     skip_noop_integrate=False)
     assert summary["finished"] and summary["final_gate"] == "n/a"
     assert count.read_text().count("run") == 3
 
@@ -714,3 +715,55 @@ async def test_independent_tasks_are_not_serial_points(repo):
     tasks = [Task("x", "x", owns=["x/**"]), Task("y", "y", owns=["y/**"])]
     s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)
     assert summary["serial"]["tasks"] == [] and summary["serial"]["share"] == 0.0
+
+
+def _integrate_plan(**a_kw):
+    return [Task("a", "a", owns=["a/**"], **a_kw), Task("b", "b", owns=["b/**"]),
+            Task("i", "i", kind=Kind.INTEGRATE.value, deps=["a", "b"], owns=["a/**", "b/**"],
+                 done_when=["test -f a/a.txt"]),
+            Task("r", "r", kind=Kind.REVIEW.value, deps=["i"], owns=["docs/**"])]
+
+
+async def test_noop_integrate_is_skipped_when_gates_green_and_nothing_open(repo):
+    s, store, g, worker, events, summary = await run(repo, _integrate_plan(), integration_gates=["true"])
+    assert summary["finished"]
+    assert ("integrate_skipped", "i") in events and "i" not in worker.calls
+    assert "r" in worker.calls                                  # the review still ran, in the same run
+    h = store.latest_handoff("i")
+    assert h["notes_for_downstream"] == "skipped: gates green, nothing to integrate" and h["skipped"]
+    assert g.tasks["i"].state == State.DONE.value
+
+
+async def test_integrate_runs_when_a_debt_is_open(repo):
+    s, store, g, worker, events, summary = await run(
+        repo, _integrate_plan(spec="mock:stub", allow_stubs=True), integration_gates=["true"])
+    assert ("integrate_skipped", "i") not in events and "i" in worker.calls
+
+
+async def test_integrate_runs_when_upstream_left_open_questions(repo):
+    worker = MockWorker()
+    orig = worker.__call__
+
+    async def asking(task, wt, pack):
+        r = await orig(task, wt, pack)
+        if task.id == "b":
+            r.fields["open_questions"] = "should b also cover the legacy path?"
+        return r
+    asking.name = "mock"
+    s, store, g, _, events, summary = await run(repo, _integrate_plan(), worker=asking, integration_gates=["true"])
+    assert ("integrate_skipped", "i") not in events and "i" in worker.calls
+
+
+async def test_integrate_runs_when_the_full_gate_or_its_own_gate_fails(repo):
+    s, store, g, worker, events, summary = await run(repo, _integrate_plan(), integration_gates=["false"])
+    assert ("integrate_skipped", "i") not in events and "i" in worker.calls
+    tasks = _integrate_plan()
+    tasks[2].done_when = ["test -f nothing/here.txt"]             # its own acceptance check fails
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["true"])
+    assert ("integrate_skipped", "i") not in events
+
+
+async def test_skip_can_be_disabled(repo):
+    s, store, g, worker, events, summary = await run(repo, _integrate_plan(), integration_gates=["true"],
+                                                     skip_noop_integrate=False)
+    assert "i" in worker.calls and ("integrate_skipped", "i") not in events

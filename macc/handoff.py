@@ -83,6 +83,16 @@ def _summ_handoff(h: dict) -> str:
     return "\n".join(lines)
 
 
+def merge_conflict_spec(task: Task, conflicts: list[str], others: list[dict]) -> str:
+    lines = [f"Resolve merge conflicts between task `{task.id}` ({task.title}) and the integration branch.",
+             "", "Conflicting files:"] + [f"- {c}" for c in conflicts] + ["", f"This task's intent:\n{task.spec.strip()}", ""]
+    if others:
+        lines.append("Other tasks that changed these files (their handoffs):")
+        for h in others:
+            lines.append(f"## {h['_task_id']}\n{_summ_handoff(h)}")
+    return "\n".join(lines)
+
+
 def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "") -> str:
     """The *only* thing a worker reads besides the repo itself. Short, stable prefix first (cacheable),
     task-specific material last."""
@@ -146,6 +156,10 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
     if task.kind == "contract":
         parts.append("# Contract output\nProduce interfaces/schemas/test plans only. Downstream tasks will "
                      "be written against exactly what you commit. Be explicit about types and error cases.")
+    if task.kind == "merge":
+        parts.append("# Merge output\nThe files listed under `owns` contain git conflict markers "
+                     "(<<<<<<< HEAD is this task's version, >>>>>>> is the integration branch). Resolve every "
+                     "marker so that BOTH intents survive. Touch no other file. Run done_when once at the end.")
     if task.kind == "review":
         parts.append("# Review output\nDo not edit code. Read the diff and tests. Report: root-cause fixes vs "
                      "symptom fixes, missing tests, ownership violations, hidden stubs. Verdict in notes_for_downstream: "

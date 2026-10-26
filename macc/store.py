@@ -161,6 +161,23 @@ class Store:
         d["_output_hash"] = r["output_hash"]
         return d
 
+    def handoffs_touching(self, paths: list[str], exclude_task: Optional[str] = None) -> list[dict]:
+        """Latest handoff of every task whose files_changed intersects `paths`."""
+        out = []
+        rows = self._conn.execute(
+            "SELECT h.* FROM handoffs h JOIN (SELECT task_id, MAX(attempt) a FROM handoffs GROUP BY task_id) m "
+            "ON h.task_id=m.task_id AND h.attempt=m.a"
+        ).fetchall()
+        wanted = set(paths)
+        for r in rows:
+            if r["task_id"] == exclude_task:
+                continue
+            d = json.loads(r["data"])
+            if wanted & {f["path"] for f in d.get("files_changed", [])}:
+                d["_task_id"] = r["task_id"]
+                out.append(d)
+        return out
+
     # ----------------------------------------------------------------- debts
     def add_debt(self, task_id: str, kind: str, note: str, path: Optional[str] = None) -> int:
         cur = self._conn.execute(

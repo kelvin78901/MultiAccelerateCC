@@ -37,6 +37,7 @@ class Kind(str, Enum):
     SPIKE = "spike"            # answer a question (hardware ok? lib works?); output is a conclusion
     REVIEW = "review"          # independent review of a diff
     INTEGRATE = "integrate"    # merge + run full gates
+    MERGE = "merge"            # resolve conflict markers (synthetic, spawned by the scheduler)
     MANUAL = "manual"          # a human does it
 
 

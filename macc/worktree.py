@@ -169,6 +169,35 @@ class Repo:
         self.git("rebase", "--abort", cwd=path, check=False)
         return MergeResult(ok=False, conflicts=conflicts, message=(p.stdout + p.stderr).strip())
 
+    # ------------------------------------------------------- conflict merge
+    def start_conflict_merge(self, task_id: str) -> list[str]:
+        """Merge integration INTO the task worktree leaving conflict markers in place.
+        Returns the conflicting paths (empty list = merged cleanly and committed)."""
+        path = self.task_path(task_id)
+        p = self.git("merge", "--no-commit", "--no-ff", INTEGRATION_BRANCH, cwd=path, check=False)
+        conflicts = self.git("diff", "--name-only", "--diff-filter=U", cwd=path, check=False).stdout.split()
+        if p.returncode == 0 and not conflicts:
+            self.git("commit", "-q", "--no-edit", "-m", f"macc({task_id}): merge integration", cwd=path, check=False)
+            return []
+        return conflicts
+
+    def abort_conflict_merge(self, task_id: str) -> None:
+        self.git("merge", "--abort", cwd=self.task_path(task_id), check=False)
+
+    def remaining_conflict_markers(self, task_id: str, files: list[str]) -> list[str]:
+        path = self.task_path(task_id)
+        bad = []
+        for f in files:
+            fp = path / f
+            if fp.exists() and re.search(r"^(<{7}|={7}|>{7})", fp.read_text(errors="replace"), re.M):
+                bad.append(f)
+        return bad
+
+    def finish_conflict_merge(self, task_id: str) -> None:
+        path = self.task_path(task_id)
+        self.git("add", "-A", cwd=path)
+        self.git("commit", "-q", "-m", f"macc({task_id}): resolve conflicts with integration", cwd=path)
+
     def run_gates(self, commands: list[str], cwd: Optional[Path] = None, timeout: int = 1800) -> list[dict]:
         """Run deterministic gate commands (tests, lint, type-check). Returns one record per command."""
         results = []

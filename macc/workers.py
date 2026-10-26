@@ -156,6 +156,18 @@ class MockWorker:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return WorkerResult(ok=False, error="preempted", preempted=True, seconds=time.time() - t0)
+        if task.kind == "merge":
+            if "mock:merge_fail" in task.spec:
+                return WorkerResult(ok=False, error="mock cannot resolve", seconds=time.time() - t0)
+            for f in task.owns:
+                fp = wt_path / f
+                if fp.exists():
+                    kept = [l for l in fp.read_text().splitlines()
+                            if not (l.startswith("<<<<<<<") or l.startswith("=======") or l.startswith(">>>>>>>"))]
+                    fp.write_text("\n".join(kept) + "\n")
+            text = f"merged\n{HANDOFF_BEGIN}\n{json.dumps({'open_questions': '', 'notes_for_downstream': 'resolved', 'stubs': []})}\n{HANDOFF_END}"
+            return WorkerResult(ok=True, output_text=text, fields=parse_worker_output(text), model="mock",
+                                input_tokens=self.tokens, output_tokens=self.tokens // 4, seconds=time.time() - t0)
         if "mock:fail_first" in task.spec and task.attempts <= 1:
             return WorkerResult(ok=False, error="mock failure", seconds=time.time() - t0,
                                 input_tokens=self.tokens, output_tokens=self.tokens // 4)

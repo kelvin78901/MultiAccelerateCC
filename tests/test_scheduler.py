@@ -257,3 +257,43 @@ async def test_review_reject_loop_is_bounded(repo):
     assert g.tasks["review"].state == State.FAILED.value
     assert summary["failed"] == ["review"]
     assert worker.calls.count("review") == 2       # bounded by max_attempts
+
+
+async def _conflict_setup(repo, merge_spec=""):
+    """Two tasks editing the same file concurrently (ownership deliberately overlapping-but-undeclared)."""
+    (repo.root / "shared.txt").write_text("line1\nline2\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo.root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "shared"], cwd=repo.root, check=True)
+    tasks = [
+        Task("a", "a", owns=["a/**"], spec="mock:sleep=0.1 mock:write=shared.txt " + merge_spec),
+        Task("b", "b", owns=["b/**"], spec="mock:sleep=0.2 mock:write=shared.txt " + merge_spec),
+    ]
+    return tasks
+
+
+async def test_merge_agent_resolves_textual_conflict(repo):
+    tasks = await _conflict_setup(repo)
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)
+    assert summary["finished"], summary
+    types = [e for e, _ in events]
+    assert "conflict" in types and "merge_agent" in types and "merge_agent_resolved" in types
+    txt = (repo.integration_path / "shared.txt").read_text()
+    assert "<<<<<<<" not in txt and "# a attempt" in txt and "# b attempt" in txt   # both intents kept
+    assert any("merge" in u["worker"] for u in [dict(r) for r in store._conn.execute("SELECT worker FROM usage")])
+
+
+async def test_merge_agent_failure_falls_back_to_retry(repo):
+    tasks = await _conflict_setup(repo, merge_spec="mock:merge_fail")
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)
+    types = [e for e, _ in events]
+    assert "merge_agent_failed" in types and "retry" in types
+    assert summary["finished"], summary           # retry on the fresh base succeeds (b re-forks after a merged)
+    txt = (repo.integration_path / "shared.txt").read_text()
+    assert "<<<<<<<" not in txt
+
+
+async def test_merge_agent_can_be_disabled(repo):
+    tasks = await _conflict_setup(repo)
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2, merge_agent=False)
+    types = [e for e, _ in events]
+    assert "merge_agent" not in types and "retry" in types and summary["finished"]

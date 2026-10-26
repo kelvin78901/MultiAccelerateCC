@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .graph import Kind, State, Task, TaskGraph
-from .handoff import build_context_pack, generate_handoff
+from .handoff import build_context_pack, generate_handoff, merge_conflict_spec
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -33,6 +33,7 @@ class SchedulerConfig:
     project_rules: str = ""                      # short, stable text prepended to every context pack
     keep_worktrees: bool = False
     revalidate_stale: bool = True
+    merge_agent: bool = True                     # spawn a merge worker on textual conflicts
 
 
 EventFn = Callable[[str, Optional[str], dict], None]
@@ -182,9 +183,15 @@ class Scheduler:
             rb = self.repo.rebase_task_on_integration(tid)
             if not rb.ok:
                 self.emit("conflict", tid, stage="rebase", files=rb.conflicts)
-                self._fail(t, f"rebase conflict in {rb.conflicts}; retried on fresh base")
-                self._cleanup(tid)
-                return
+                resolved = await self._merge_agent(t, wt)
+                if not resolved:
+                    self._fail(t, f"rebase conflict in {rb.conflicts}; retried on fresh base")
+                    self._cleanup(tid)
+                    return
+                # the merge agent changed the tree: regenerate facts
+                base = self.repo.merge_base(wt)
+                handoff = generate_handoff(self.repo, t, wt, gates, res.fields, base)
+                out_hash = self.repo.output_hash(wt, base)
             before = self.repo.head(self.repo.integration_path)
             mr = self.repo.merge_task(tid)
             if not mr.ok:
@@ -225,6 +232,41 @@ class Scheduler:
                 self.running[c].cancel()
                 self.emit("preempt_requested", c, because=tid)
         self._cleanup(tid)
+
+    async def _merge_agent(self, t: Task, wt: Path) -> bool:
+        """Textual conflict: merge integration into the task worktree, hand the conflict markers to a
+        merge worker restricted to the conflicting files, then verify (no markers, task gates pass)."""
+        if not self.cfg.merge_agent:
+            return False
+        conflicts = self.repo.start_conflict_merge(t.id)
+        if not conflicts:
+            return True
+        others = self.store.handoffs_touching(conflicts, exclude_task=t.id)
+        mt = Task(id=f"{t.id}.merge", title=f"resolve conflicts for {t.id}", kind=Kind.MERGE.value,
+                  owns=conflicts, effort="high", done_when=t.done_when,
+                  spec=merge_conflict_spec(t, conflicts, others), attempts=t.attempts)
+        pack = build_context_pack(mt, self.graph, self.store, self.cfg.project_rules)
+        (self.repo.macc_dir / "context" / f"{mt.id}.md").write_text(pack)
+        self.emit("merge_agent", t.id, files=conflicts, others=[h["_task_id"] for h in others])
+        try:
+            res = await self.worker(mt, wt, pack)
+        except Exception as e:
+            res = WorkerResult(ok=False, error=f"merge worker exception: {e!r}")
+        self.tokens_used += res.input_tokens + res.output_tokens
+        self.store.add_usage(t.id, t.attempts, self._worker_name() + ":merge", res.ok, model=res.model,
+                             input_tokens=res.input_tokens, output_tokens=res.output_tokens,
+                             cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
+        leftover = self.repo.remaining_conflict_markers(t.id, conflicts) if res.ok else conflicts
+        gates_ok = True
+        if res.ok and not leftover and t.done_when:
+            gates_ok = all(g["ok"] for g in self.repo.run_gates(t.done_when, cwd=wt))
+        if not res.ok or leftover or not gates_ok:
+            self.repo.abort_conflict_merge(t.id)
+            self.emit("merge_agent_failed", t.id, leftover=leftover, gates_ok=gates_ok, error=(res.error or "")[:300])
+            return False
+        self.repo.finish_conflict_merge(t.id)
+        self.emit("merge_agent_resolved", t.id, files=conflicts)
+        return True
 
     def _review_reject(self, review: Task, notes: str) -> None:
         """REJECT verdict: reopen the reviewed tasks with the notes as their error context.

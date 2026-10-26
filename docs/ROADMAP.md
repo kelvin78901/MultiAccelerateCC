@@ -22,6 +22,13 @@ Graph, store, worktrees, handoffs, scheduler, CLI, mock worker, 32 tests.
       hashes; planner warns on them); `usage.est_minutes` recorded per run and `macc status` shows
       actual/est per kind; advisory `rules_conflict` event when rules.md and CLAUDE.md disagree on the
       interpreter path; run summary reports `cost_this_run` and `cost_since_plan`.
+- [x] v0.2.9: `gate_policy: per_task | full` (per_task default: a task's own `done_when` after its merge,
+      reused when the merged tree equals the tree it passed on; full suite after `integrate` and once at
+      the end, `final_gate_failed` keeps state); reviewers get the latest full-gate result (only claimed
+      for the same integration HEAD); planner prompt carries per-kind median seconds and actual/est from
+      `usage` (>= 3 samples; `usage.kind` added and backfilled); run summary and `status` show this run's
+      critical path, actual vs estimate. Fix: a `REOPEN:` naming a non-direct ancestor now holds the tasks
+      in between as STALE, so the review waits for the redo (it used to re-review the unchanged tree).
 
 ### Real-run data (2026-10-26; input for the v0.3 cost model)
 Source: `usage` and `events` in `~/macc-smoke/.macc/state.db` and `AutoLeaseRank/.macc/state.db`.
@@ -60,6 +67,13 @@ What this says:
 - **Planner estimates are 10–50x too high**: actual/est = 0.061 (plan3 r1), 0.047 (watch r1); by kind
   (plan3 r1 / watch r1): code 0.020 / 0.031, contract 0.22 / 0.088, integrate 0.060 / 0.037,
   review 0.28 / 0.115. Estimates are human-minutes; do not use them raw for scheduling or split decisions.
+- **Gate policy, measured** (macc-smoke, plan3 review round 2 via `macc change`, full suite 124-127 tests
+  ≈ 41 s): run A (kv_server + kv_tests_server, then a test redo; 3 merges) spent 41 s in post-merge gates
+  under per_task (the final full gate only) against ≈ 123 s under full: **82 s saved**. Run B (a lone
+  review whose `done_when` is the full suite) spent 82 s against 41 s: the post-merge re-run duplicated
+  the worktree gate. Fixed in the same release by reusing the gate when the tree is unchanged; with it,
+  run B costs the same as full. Rule of thumb: per_task saves (merges − 1) × full-suite time when task
+  gates are cheap; it buys nothing for a task whose own gate is the full suite.
 - Reliability: 32 worker runs, 1 transient CLI failure (stdin race, fixed in v0.2.2), 1 gate failure
   from tests merged before their implementation (fixed by `merge_after`), 1 out-of-scope commit
   caught by review (fixed by scoped commits), 1 REJECT → reopen → APPROVE.

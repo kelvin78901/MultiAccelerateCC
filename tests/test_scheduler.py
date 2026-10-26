@@ -134,7 +134,7 @@ async def test_gate_failure_retries_with_error_context(repo):
 async def test_integration_gate_reverts_merge(repo):
     tasks = [Task("bad", "bad", owns=["x/**"], max_attempts=1)]
     s, store, g, worker, events, summary = await run(
-        repo, tasks, integration_gates=["test ! -f x/bad.txt"])
+        repo, tasks, integration_gates=["test ! -f x/bad.txt"], gate_policy="full")
     assert g.tasks["bad"].state == State.FAILED.value
     assert not (repo.integration_path / "x" / "bad.txt").exists()
     assert ("integration_gate_failed", "bad") in events
@@ -209,7 +209,7 @@ async def test_broken_baseline_gate_blocks_without_charging_attempt(repo):
     """If the integration gate fails on the baseline too, it is an environment problem:
     task -> BLOCKED, attempt not charged, merge reverted."""
     tasks = [Task("t", "t", owns=["x/**"], max_attempts=2)]
-    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["false"])
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["false"], gate_policy="full")
     t = g.tasks["t"]
     assert t.state == State.BLOCKED.value and t.attempts == 0
     assert ("gate_broken_baseline", "t") in events and ("retry", "t") not in events
@@ -407,7 +407,15 @@ async def test_review_reopen_names_specific_tasks(repo):
     assert summary["finished"], summary
     rej = next(p for t, tid, p in events if t == "review_rejected")
     assert rej["reviewed"] == ["b"]
+    assert rej["held"] == ["integrate"]          # between b and the review: must not stay DONE
     assert worker.calls.count("b") >= 2 and worker.calls.count("a") == 1
+    # the second review must see b's redo: it is dispatched only after b is done again and integrate
+    # has been revalidated or re-run (regression: it used to start in the same tick as b's redo)
+    seq = [(t, tid) for t, tid, p in events]
+    second_review = [i for i, e in enumerate(seq) if e == ("dispatched", "review")][1]
+    b_redone = [i for i, e in enumerate(seq) if e == ("done", "b")][1]
+    integrate_ok = max(i for i, e in enumerate(seq) if e in (("done", "integrate"), ("revalidated", "integrate")))
+    assert b_redone < integrate_ok < second_review
 
 
 async def test_cost_budget_is_cumulative_across_runs(repo):
@@ -523,3 +531,114 @@ async def test_no_rules_conflict_when_consistent(repo):
     s, store, g, worker, events, summary = await run(
         repo, [Task("a", "a", owns=["a/**"])], project_rules="- Interpreter is `/opt/p/.venv/bin/python`.")
     assert not [e for e in events if e[0] == "rules_conflict"]
+
+
+def _counting_gate(tmp_path):
+    f = tmp_path / "full_gate_runs.txt"
+    return f, [f"echo run >> {f}"]
+
+
+async def test_gate_policy_per_task_runs_full_suite_after_integrate_only(repo, tmp_path):
+    count, gate = _counting_gate(tmp_path)
+    tasks = [Task("a", "a", owns=["a/**"], done_when=["test -f a/a.txt"]),
+             Task("b", "b", owns=["b/**"]),
+             Task("i", "i", kind=Kind.INTEGRATE.value, deps=["a", "b"], owns=["i/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=gate)
+    assert summary["finished"] and summary["gate_policy"] == "per_task"
+    assert count.read_text().count("run") == 1                 # only after the integrate merge
+    assert summary["final_gate"] == "covered"                  # nothing merged after that full gate
+    full = [e for e in store.events(limit=500) if e["type"] == "full_gate"]
+    assert len(full) == 1 and full[0]["task_id"] == "i"
+
+
+async def test_gate_policy_full_runs_suite_after_every_merge(repo, tmp_path):
+    count, gate = _counting_gate(tmp_path)
+    tasks = [Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"]),
+             Task("i", "i", kind=Kind.INTEGRATE.value, deps=["a", "b"], owns=["i/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=gate, gate_policy="full")
+    assert summary["finished"] and summary["final_gate"] == "n/a"
+    assert count.read_text().count("run") == 3
+
+
+async def test_per_task_without_integrate_runs_one_final_full_gate(repo, tmp_path):
+    count, gate = _counting_gate(tmp_path)
+    s, store, g, worker, events, summary = await run(
+        repo, [Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"])], integration_gates=gate)
+    assert summary["final_gate"] == "passed" and count.read_text().count("run") == 1
+    assert summary["gate_seconds"] >= 0
+
+
+async def test_final_gate_failure_reports_merge_order_and_keeps_state(repo):
+    tasks = [Task("ok", "ok", owns=["ok/**"]), Task("bad", "bad", owns=["x/**"], deps=["ok"])]
+    evs = []
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    s = Scheduler(repo, store, g, MockWorker(), SchedulerConfig(integration_gates=["test ! -f x/bad.txt"]),
+                  on_event=lambda t, tid, p: evs.append((t, p)))
+    summary = await s.run()
+    assert summary["final_gate"] == "failed"
+    fail = next(p for t, p in evs if t == "final_gate_failed")
+    assert fail["merged"] == ["ok", "bad"] and fail["cmd"] == "test ! -f x/bad.txt"
+    assert g.tasks["bad"].state == State.DONE.value               # not rolled back
+    assert (repo.integration_path / "x" / "bad.txt").exists()
+
+
+async def test_per_task_gate_failure_on_integration_tree_fails_the_task(repo):
+    # t forks before w merges (both dispatched at once, t is slower): its done_when passes in its own
+    # worktree but fails on the integration tree, where w/w.txt now exists
+    tasks = [Task("w", "w", owns=["w/**"]),
+             Task("t", "t", owns=["t/**"], max_attempts=1, spec="mock:sleep=0.3", done_when=["test ! -f w/w.txt"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2, integration_gates=["true"])
+    assert g.tasks["t"].state == State.FAILED.value
+    assert ("integration_gate_failed", "t") in events
+    assert ("gate_broken_baseline", "t") not in events         # a task's own gate is not a baseline check
+    assert not (repo.integration_path / "t" / "t.txt").exists()  # merge reverted
+
+
+def test_gate_policy_is_validated():
+    with pytest.raises(ValueError):
+        SchedulerConfig(gate_policy="sometimes")
+
+
+def test_review_context_pack_reports_latest_full_gate(tmp_path):
+    from macc.handoff import build_context_pack
+    store = Store(tmp_path / "s.db")
+    g = TaskGraph([Task("i", "i", kind="integrate"), Task("r", "r", kind="review", deps=["i"])])
+    assert "Latest full integration gate" not in build_context_pack(g.tasks["r"], g, store)
+    store.event("full_gate", "i", ok=True, seconds=12.5, cmds=["pytest -q"], failed_cmd=None, head="a" * 40)
+    same = build_context_pack(g.tasks["r"], g, store, integration_head="a" * 40)
+    assert "PASSED" in same and "12.5 s" in same and "Do not re-run it in full" in same
+    moved = build_context_pack(g.tasks["r"], g, store, integration_head="b" * 40)
+    assert "older tree" in moved and "Do not re-run" not in moved
+    code = build_context_pack(g.tasks["i"], g, store)
+    assert "Latest full integration gate" not in code             # only reviewers get it
+
+
+async def test_summary_reports_critical_path_with_estimate(repo):
+    tasks = [Task("c", "c", kind=Kind.CONTRACT.value, owns=["api/**"], est_minutes=10, spec="mock:sleep=0.2"),
+             Task("x", "x", deps=["c"], owns=["x/**"], est_minutes=30, spec="mock:sleep=0.2"),
+             Task("y", "y", deps=["c"], owns=["y/**"], est_minutes=5)]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=3)
+    cp = summary["critical_path"]
+    assert cp["tasks"] == ["c", "x"] and cp["est_min"] == 40
+    assert 0.3 <= cp["actual_s"] < 5 and cp["actual_over_est"] == round(cp["actual_s"] / 60 / 40, 3)
+
+
+async def test_per_task_reuses_worktree_gate_when_tree_is_unchanged(repo, tmp_path):
+    runs = tmp_path / "done_when_runs.txt"
+    gate = f"echo run >> {runs}"
+    # a alone: nothing merges between its gate and its merge, so the integration tree equals its own
+    s, store, g, worker, events, summary = await run(repo, [Task("a", "a", owns=["a/**"], done_when=[gate])],
+                                                     integration_gates=["true"])
+    assert summary["finished"] and ("gate_reused", "a") in events
+    assert runs.read_text().count("run") == 1            # worktree only; not repeated after the merge
+
+
+async def test_per_task_reruns_gate_when_base_moved(repo, tmp_path):
+    runs = tmp_path / "done_when_runs.txt"
+    gate = f"echo run >> {runs}"
+    tasks = [Task("w", "w", owns=["w/**"]),
+             Task("t", "t", owns=["t/**"], spec="mock:sleep=0.3", done_when=[gate])]   # w merges first
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2, integration_gates=["true"])
+    assert summary["finished"] and ("gate_reused", "t") not in events
+    assert runs.read_text().count("run") == 2            # worktree, then again on the moved integration tree

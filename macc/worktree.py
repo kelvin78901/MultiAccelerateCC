@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -84,6 +85,10 @@ class Repo:
 
     def head(self, cwd: Optional[Path] = None) -> str:
         return self.git("rev-parse", "HEAD", cwd=cwd).stdout.strip()
+
+    def tree(self, cwd: Path) -> str:
+        """Tree hash of HEAD: equal trees mean identical file contents, whatever the commit history."""
+        return self.git("rev-parse", "HEAD^{tree}", cwd=cwd).stdout.strip()
 
     def default_branch(self) -> Optional[str]:
         """The repo's mainline: origin/HEAD if set, else `main`, else `master`."""
@@ -306,6 +311,7 @@ class Repo:
         results = []
         env = {**os.environ, **self.macc_env()} if commands else None
         for cmd in commands:
+            t0 = time.time()
             try:
                 p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.integration_path),
                                    capture_output=True, text=True, timeout=timeout, env=env)
@@ -313,6 +319,7 @@ class Repo:
                                 "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]})
             except subprocess.TimeoutExpired:
                 results.append({"cmd": cmd, "ok": False, "code": -1, "stdout": "", "stderr": "timeout"})
+            results[-1]["seconds"] = round(time.time() - t0, 2)
             if not results[-1]["ok"]:
                 break
         return results

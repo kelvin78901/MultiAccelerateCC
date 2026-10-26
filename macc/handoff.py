@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -137,7 +138,29 @@ def merge_conflict_spec(task: Task, conflicts: list[str], others: list[dict]) ->
     return "\n".join(lines)
 
 
-def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "") -> str:
+def _full_gate_note(ev: dict, integration_head: Optional[str]) -> str:
+    """Tell a reviewer what the scheduler already verified, so it does not re-run the whole suite.
+    The claim holds only if the gate ran on the tree being reviewed (same integration HEAD)."""
+    p = ev["payload"]
+    if integration_head and p.get("head") and p["head"] != integration_head:
+        return ("# Latest full integration gate\n"
+                f"- it ran on an older tree ({p['head'][:12]}, result {'PASSED' if p.get('ok') else 'FAILED'}); "
+                f"the integration branch has moved to {integration_head[:12]} since. Run the full suite yourself.")
+    when = time.strftime("%H:%M:%S", time.localtime(ev["ts"]))
+    lines = ["# Latest full integration gate",
+             f"- commands: {p.get('cmds')}",
+             f"- result: {'PASSED' if p.get('ok') else 'FAILED at ' + str(p.get('failed_cmd'))}",
+             f"- duration: {p.get('seconds')} s (at {when}, after merging {ev['task_id'] or 'the last task of the run'})"]
+    if p.get("ok"):
+        lines.append("The scheduler already ran the full suite on this tree. Do not re-run it in full; run only "
+                     "the extra, targeted checks your review adds.")
+    else:
+        lines.append("Treat this failure as a blocker unless you show it is unrelated to the reviewed work.")
+    return "\n".join(lines)
+
+
+def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "",
+                       integration_head: Optional[str] = None) -> str:
     """The *only* thing a worker reads besides the repo itself. Short, stable prefix first (cacheable),
     task-specific material last."""
     parts: list[str] = []
@@ -214,4 +237,7 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
                      "with a line `VERDICT: APPROVE` or `VERDICT: REJECT`, followed by reasons. On REJECT add a line "
                      "`REOPEN: <task ids>` naming the tasks whose work must be redone (any ancestor task of this "
                      "review; see the upstream handoffs for ids). Without it, the direct dependencies are reopened.")
+        fg = store.latest_event("full_gate")
+        if fg:
+            parts.append(_full_gate_note(fg, integration_head))
     return "\n\n".join(parts) + "\n"

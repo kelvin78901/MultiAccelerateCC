@@ -79,3 +79,25 @@ def test_plan_warnings_flag_commit_hashes():
 def test_planner_prompt_mentions_macc_refs():
     from macc.planner import PLANNER_PROMPT
     assert "$MACC_BASE" in PLANNER_PROMPT and "$MACC_INTEGRATION" in PLANNER_PROMPT
+
+
+def test_format_history_and_prompt_injection(tmp_path):
+    from macc.planner import format_history
+    assert "no history yet" in format_history({})
+    txt = format_history({"code": {"median_seconds": 37.0, "runs": 21, "median_actual_over_est": 0.031, "tasks": 12},
+                          "review": {"median_seconds": 187.0, "runs": 5}})
+    assert "- code: median 37 s of worker time per run (21 runs); median actual/est_minutes = 0.031 (12 tasks)" in txt
+    assert "- review: median 187 s" in txt and "actual/est" not in txt.split("- review:")[1].split("\n")[0]
+
+
+async def test_generate_plan_prompt_carries_history(tmp_path):
+    seen = []
+
+    class Spy(MockWorker):
+        async def __call__(self, task, wt, pack):
+            seen.append(pack)
+            return await super().__call__(task, wt, pack)
+
+    await generate_plan("feature", tmp_path, Spy(), tmp_path / "p.yaml",
+                        history={"code": {"median_seconds": 40.0, "runs": 3}})
+    assert "# Measured history in this repo" in seen[0] and "- code: median 40 s" in seen[0]

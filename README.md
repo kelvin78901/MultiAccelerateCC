@@ -104,6 +104,11 @@ tasks:
     spec: ...
 ```
 
+Gates: with `gate_policy: per_task` (default) a merge runs only that task's `done_when` on the
+integration tree (skipped when the tree is identical to the one it passed on in the worktree); the full
+`integration_gates` run after `integrate` merges and once at the end of the run (`final_gate_failed` if
+that fails; nothing is rolled back). `gate_policy: full` runs the full suite after every merge.
+
 Never hard-code a commit hash in a spec or `done_when`: the base moves. Every worker and gate gets
 `MACC_BASE` (merge-base of `macc/integration` and the mainline) and `MACC_INTEGRATION` (integration
 HEAD), e.g. `git diff --quiet "$MACC_BASE" -- vendor/`.

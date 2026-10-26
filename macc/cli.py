@@ -85,7 +85,8 @@ def cmd_plan(a) -> int:
         cfg_now = json.loads((repo.macc_dir / "config.json").read_text()) if (repo.macc_dir / "config.json").exists() else {}
         gate_now = " && ".join(cfg_now.get("integration_gates", []))
         pr = asyncio.run(generate_plan(a.from_desc, ipath, worker, out, effort=a.effort, model=a.model,
-                                       existing_files=existing, current_gate=gate_now))
+                                       existing_files=existing, current_gate=gate_now,
+                                       history=store.history_by_kind()))
         g = pr.graph
         for i, u in enumerate(pr.usage, 1):
             store.add_usage("_plan", i, getattr(worker, "name", "worker"), u.ok, model=u.model,
@@ -209,6 +210,12 @@ def cmd_status(a) -> int:
     u = store.usage_totals()
     print(f"\nusage: runs={u['runs']} in={u['input_tokens']} out={u['output_tokens']} "
           f"cache_read={u['cache_read_tokens']} cost=${u['cost_usd']:.2f} worker_time={u['seconds']:.0f}s")
+    last = store.latest_event("run_finished")
+    cp = (last or {}).get("payload", {}).get("critical_path") if last else None
+    if cp:
+        ratio = f" (actual/est={cp['actual_over_est']:.3f})" if cp.get("actual_over_est") is not None else ""
+        print(f"last run critical path: {' -> '.join(cp['tasks'])}: actual {cp['actual_s']:.0f} s, "
+              f"est {cp['est_min']:.0f} min{ratio}")
     for row in store.usage_by_kind():
         est = (f"actual/est={row['est_ratio']:.2f} ({row['est_tasks']} tasks)"
                if row.get("est_ratio") is not None else "actual/est=-")

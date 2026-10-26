@@ -67,4 +67,32 @@ def test_usage_est_minutes_migration_and_ratio(tmp_path):
     assert abs(ratios["code"]["ratio"] - (3 + 3) / (10 + 30)) < 1e-9
     assert abs(ratios["review"]["ratio"] - 0.5) < 1e-9
     by_kind = {r["kind"]: r for r in s.usage_by_kind()}
-    assert by_kind["code"]["est_ratio"] == ratios["code"]["ratio"] and by_kind["code"]["runs"] == 4
+    assert by_kind["code"]["est_ratio"] == ratios["code"]["ratio"] and by_kind["code"]["runs"] == 3  # legacy: no kind
+
+
+def test_migration_backfills_kind_and_estimate_and_history(tmp_path):
+    import sqlite3
+    db = tmp_path / "s.db"
+    s = Store(db)
+    s.save_graph(TaskGraph([Task("c1", "c", est_minutes=20), Task("rv", "r", kind="review", est_minutes=10)]))
+    s.close()
+    raw = sqlite3.connect(db)            # rows as an older macc wrote them: no kind, no estimate
+    for tid, secs in [("c1", 30), ("c1", 90), ("rv", 120), ("_plan", 200)]:
+        raw.execute("INSERT INTO usage(task_id, attempt, worker, ok, seconds, model) VALUES (?,1,'claude',1,?,'m')",
+                    (tid, secs))
+    raw.commit(); raw.close()
+    s = Store(db)                        # reopening migrates
+    rows = {(r["task_id"], r["kind"], r["est_minutes"]) for r in s._conn.execute("SELECT * FROM usage")}
+    assert ("c1", "code", 20) in rows and ("rv", "review", 10) in rows and ("_plan", "plan", None) in rows
+
+    # history: needs >= 3 samples per statistic
+    assert s.history_by_kind() == {}
+    s.save_graph(TaskGraph([Task("c2", "c", est_minutes=10), Task("c3", "c", est_minutes=10)]))
+    s.add_usage("c2", 1, "claude", True, seconds=60, est_minutes=10, model="m")
+    s.add_usage("c3", 1, "claude", True, seconds=120, est_minutes=10, model="m")
+    s.add_usage("c3", 2, "claude", False, seconds=5, est_minutes=10, model=None)   # CLI never started
+    h = s.history_by_kind()
+    assert set(h) == {"code"}                                  # review has 1 sample; plan is excluded
+    assert h["code"]["median_seconds"] == 75.0 and h["code"]["runs"] == 4          # 30, 60, 90, 120
+    # per task actual/est: c1 = 2 min / 20 = 0.1, c2 = 1/10 = 0.1, c3 = (120+5)/60/10 = 0.208
+    assert h["code"]["median_actual_over_est"] == 0.1 and h["code"]["tasks"] == 3

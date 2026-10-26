@@ -31,13 +31,20 @@ class SchedulerConfig:
     max_parallel: int = 3
     token_budget: Optional[int] = None          # total input+output tokens across all runs
     cost_budget_usd: Optional[float] = None     # total reported cost (includes cache reads); preferred
-    integration_gates: list[str] = field(default_factory=list)   # run after every merge
+    integration_gates: list[str] = field(default_factory=list)   # the full suite (see gate_policy)
+    # per_task: after a merge run only that task's done_when on the integration tree; the full
+    # integration_gates run after `integrate` merges and once at the end of the run. full: after every merge.
+    gate_policy: str = "per_task"
     project_rules: str = ""                      # short, stable text prepended to every context pack
     keep_worktrees: bool = False
     revalidate_stale: bool = True
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
     cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
+
+    def __post_init__(self) -> None:
+        if self.gate_policy not in ("per_task", "full"):
+            raise ValueError(f"gate_policy must be 'per_task' or 'full', not {self.gate_policy!r}")
     max_transients: int = 4                      # infra failures tolerated per task before BLOCKED
 
 
@@ -56,6 +63,11 @@ class Scheduler:
         self.running: dict[str, asyncio.Task] = {}
         self.parked: dict[str, dict] = {}        # finished workers waiting for merge_after targets
         self._rules_conflicts_seen: set[str] = set()
+        self.merged_this_run: list[str] = []
+        self._merged_since_full_gate = False      # per_task policy: the final full gate is still owed
+        self.gate_seconds = 0.0                   # wall time spent in post-merge gates this run
+        self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
+        self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
         self.backoff: dict[str, float] = {}      # task -> earliest re-dispatch time (transient failures)
         self.tokens_used = 0
         # budget is cumulative over runs of the same plan: start from what was already spent since plan load
@@ -131,7 +143,8 @@ class Scheduler:
         t.worker = self._worker_name()
         t.branch = self.repo.task_branch(t.id)
         wt = self.repo.create_task_worktree(t.id, fresh=True)
-        pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules)
+        head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
+        pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head)
         self._check_rules_conflict(t, wt)
         if t.last_error:
             pack += f"\n# Previous attempt failed\n{t.last_error[-3000:]}\n"
@@ -169,10 +182,11 @@ class Scheduler:
         self.tokens_used += res.input_tokens + res.output_tokens
         self.cost_used += res.cost_usd
         self.runs_done += 1
+        self.run_seconds[tid] = self.run_seconds.get(tid, 0.0) + res.seconds
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
-                             est_minutes=t.est_minutes)
+                             est_minutes=t.est_minutes, kind=t.kind)
 
         if res.preempted or t.preempt:
             t.attempts = max(0, t.attempts - 1)       # a preempted run is not a failed attempt
@@ -229,6 +243,8 @@ class Scheduler:
             self._fail(t, f"gate failed: {bad['cmd']}\n{bad['stderr'][-1500:]}\n{bad['stdout'][-1500:]}")
             self._cleanup(tid)
             return
+        if gates:
+            self._gated_tree[tid] = self.repo.tree(wt)    # the exact tree these done_when passed on
 
         # 3. handoff + debts (generated from facts; LLM wrote two fields)
         base = self.repo.merge_base(wt)
@@ -314,12 +330,20 @@ class Scheduler:
                 self._cleanup(tid)
                 return
             # 5. integration gates; revert the merge if they fail
-            igates = self.repo.run_gates(self.cfg.integration_gates) if self.cfg.integration_gates else []
+            full = self.cfg.gate_policy == "full" or t.kind == Kind.INTEGRATE.value
+            cmds = list(self.cfg.integration_gates) if full else list(t.done_when)
+            if not full and cmds and self._gated_tree.get(tid) == self.repo.tree(self.repo.integration_path):
+                # the rebase was a no-op: integration now holds exactly the tree the task's gates passed on
+                self.emit("gate_reused", tid, cmds=cmds)
+                cmds = []
+            igates = self.repo.run_gates(cmds) if cmds else []
+            self._record_gates(tid, igates, full)
             if igates and not all(g["ok"] for g in igates):
                 self.repo.git("reset", "--hard", before, cwd=self.repo.integration_path)
                 bad = next(g for g in igates if not g["ok"])
                 # Was the baseline already broken? Then this is an environment problem, not the task's.
-                baseline = self.repo.run_gates([bad["cmd"]])
+                # (Only meaningful for the shared suite: a task's own done_when fails on a tree without it.)
+                baseline = self.repo.run_gates([bad["cmd"]]) if full else [{"ok": True}]
                 if not baseline[0]["ok"]:
                     t.attempts = max(0, t.attempts - 1)       # do not charge the attempt
                     t.state = State.BLOCKED.value
@@ -334,6 +358,8 @@ class Scheduler:
                 self._cleanup(tid)
                 return
             handoff["merge_commit"] = mr.merge_commit
+            self.merged_this_run.append(tid)
+            self._merged_since_full_gate = not (full and cmds)
 
         # 6. done + staleness propagation
         self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
@@ -347,6 +373,55 @@ class Scheduler:
                 self.running[c].cancel()
                 self.emit("preempt_requested", c, because=tid)
         self._cleanup(tid)
+
+    def critical_path_this_run(self) -> dict:
+        """Longest chain (hard deps) of tasks that ran in this run, by actual worker seconds, with the
+        planner's estimate for the same chain. merge_after is not a chain: those tasks run in parallel."""
+        ran = self.run_seconds
+        if not ran:
+            return {}
+        memo: dict[str, tuple[float, list[str]]] = {}
+
+        def longest(tid: str) -> tuple[float, list[str]]:
+            if tid not in memo:
+                best: tuple[float, list[str]] = (0.0, [])
+                for d in self.graph.tasks[tid].deps:
+                    if d in ran:
+                        cand = longest(d)
+                        if cand[0] > best[0]:
+                            best = cand
+                memo[tid] = (best[0] + ran[tid], best[1] + [tid])
+            return memo[tid]
+
+        actual, path = max((longest(t) for t in ran), key=lambda x: x[0])
+        est = sum(self.graph.tasks[t].est_minutes for t in path)
+        return {"tasks": path, "actual_s": round(actual, 1), "est_min": round(est, 1),
+                "actual_over_est": round(actual / 60 / est, 3) if est else None}
+
+    def _record_gates(self, tid: Optional[str], gates: list[dict], full: bool) -> None:
+        secs = round(sum(g.get("seconds", 0.0) for g in gates), 2)
+        self.gate_seconds += secs
+        if full and gates:
+            bad = next((g for g in gates if not g["ok"]), None)
+            self.emit("full_gate", tid, ok=bad is None, seconds=secs, cmds=[g["cmd"] for g in gates],
+                      failed_cmd=bad["cmd"] if bad else None, head=self.repo.head(self.repo.integration_path))
+
+    def _final_gate(self) -> str:
+        """per_task policy: one full integration gate at the end if anything merged since the last one.
+        On failure nothing is rolled back; the merge order is reported for a human or the next integrate."""
+        if self.cfg.gate_policy == "full" or not self.cfg.integration_gates:
+            return "n/a"
+        if not self._merged_since_full_gate:
+            return "skipped" if not self.merged_this_run else "covered"
+        gates = self.repo.run_gates(self.cfg.integration_gates)
+        self._record_gates(None, gates, full=True)
+        bad = next((g for g in gates if not g["ok"]), None)
+        if bad is None:
+            self._merged_since_full_gate = False
+            return "passed"
+        self.emit("final_gate_failed", None, cmd=bad["cmd"], merged=list(self.merged_this_run),
+                  output=(bad["stderr"][-800:] + bad["stdout"][-800:]))
+        return "failed"
 
     async def _merge_agent(self, t: Task, wt: Path) -> bool:
         """Textual conflict: merge integration into the task worktree, hand the conflict markers to a
@@ -369,10 +444,11 @@ class Scheduler:
             res = WorkerResult(ok=False, error=f"merge worker exception: {e!r}")
         self.tokens_used += res.input_tokens + res.output_tokens
         self.cost_used += res.cost_usd
+        self.run_seconds[t.id] = self.run_seconds.get(t.id, 0.0) + res.seconds
         self.store.add_usage(t.id, t.attempts, self._worker_name() + ":merge", res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
-                             est_minutes=t.est_minutes)
+                             est_minutes=t.est_minutes, kind=t.kind)
         leftover = self.repo.remaining_conflict_markers(t.id, conflicts) if res.ok else conflicts
         gates_ok = True
         if res.ok and not leftover and t.done_when:
@@ -402,9 +478,19 @@ class Scheduler:
             u.state = State.PENDING.value
             u.attempts = 0
             u.last_error = f"review rejected (round {review.attempts}): {notes[:2500]}"
+        # A reopened task that is not a direct dep (REOPEN: names an ancestor) leaves the DONE tasks between
+        # it and the review untouched, so the review would be ready again at once and re-review the same
+        # tree. Make those in-between tasks STALE: they revalidate (or re-run) after the redo, and only then
+        # does the review run.
+        between = set()
+        for d in reviewed:
+            between |= self.graph.descendants(d) & self.graph.ancestors(review.id)
+        between = sorted(x for x in between - set(reviewed) if self.graph.tasks[x].state == State.DONE.value)
+        for x in between:
+            self.graph.tasks[x].state = State.STALE.value
         self.store.add_decision(f"Review round {review.attempts} rejected", notes[:2000], affects=reviewed)
-        self._persist(*reviewed)
-        self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts)
+        self._persist(*reviewed, *between)
+        self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts, held=between)
         self._fail(review, "review rejected: " + notes[:1500])   # PENDING until max_attempts, then FAILED
 
     def _fail(self, t: Task, error: str, final: bool = False) -> None:
@@ -493,6 +579,7 @@ class Scheduler:
             self._persist(tid)
             self.emit("parked_reset", tid, after=t.merge_after)
             self._cleanup(tid)
+        final_gate = self._final_gate()
         summary = {
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),
@@ -501,6 +588,10 @@ class Scheduler:
             "cost_this_run": round(self.cost_used - self._cost_at_start, 4),
             "cost_since_plan": round(self.cost_used, 4),
             "seconds": round(time.time() - t0, 2),
+            "critical_path": self.critical_path_this_run(),
+            "gate_policy": self.cfg.gate_policy,
+            "gate_seconds": round(self.gate_seconds, 2),
+            "final_gate": final_gate,
             "stopped_reason": self.stopped_reason,
             "failed": [t.id for t in self.graph.tasks.values() if t.state == State.FAILED.value],
             "blocked": [t.id for t in self.graph.tasks.values() if t.state == State.BLOCKED.value],

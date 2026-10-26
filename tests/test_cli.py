@@ -105,3 +105,15 @@ def test_status_shows_estimate_ratio(repo_dir, tmp_path, capsys):
     assert main(["--repo", r, "status"]) == 0
     out = capsys.readouterr().out
     assert "actual/est=" in out and "(1 tasks)" in out
+
+
+def test_status_prints_last_critical_path(repo_dir, tmp_path, capsys):
+    plan = tmp_path / "p.yaml"
+    plan.write_text("tasks:\n  - id: a\n    title: a\n    owns: ['a/**']\n    est_minutes: 10\n"
+                    "  - id: b\n    title: b\n    deps: [a]\n    owns: ['b/**']\n    est_minutes: 20\n")
+    r = str(repo_dir)
+    assert main(["--repo", r, "plan", str(plan)]) == 0
+    assert main(["--repo", r, "run", "--worker", "mock", "--gate", "true"]) == 0
+    capsys.readouterr()
+    assert main(["--repo", r, "status"]) == 0
+    assert "last run critical path: a -> b: actual" in capsys.readouterr().out

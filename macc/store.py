@@ -20,6 +20,12 @@ from typing import Iterator, Optional
 
 from .graph import Task, TaskGraph
 
+
+def _median(xs: list[float]) -> float:
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -73,7 +79,8 @@ CREATE TABLE IF NOT EXISTS usage (
     cost_usd REAL DEFAULT 0,
     seconds REAL DEFAULT 0,
     ok INTEGER NOT NULL,
-    est_minutes REAL            -- planner estimate for the task at run time (calibration input)
+    est_minutes REAL,           -- planner estimate for the task at run time (calibration input)
+    kind TEXT                   -- task kind at run time (tasks rows vanish when a new plan is loaded)
 );
 """
 
@@ -92,6 +99,16 @@ class Store:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(usage)")}
         if "est_minutes" not in cols:   # state.db created before v0.2.7
             self._conn.execute("ALTER TABLE usage ADD COLUMN est_minutes REAL")
+        if "kind" not in cols:          # before v0.2.9
+            self._conn.execute("ALTER TABLE usage ADD COLUMN kind TEXT")
+        # backfill older rows from tasks that still exist (estimates do not change after planning)
+        self._conn.execute(
+            "UPDATE usage SET kind = (SELECT t.kind FROM tasks t WHERE t.id = usage.task_id) "
+            "WHERE kind IS NULL AND task_id IN (SELECT id FROM tasks)")
+        self._conn.execute(
+            "UPDATE usage SET est_minutes = (SELECT json_extract(t.data, '$.est_minutes') FROM tasks t "
+            "WHERE t.id = usage.task_id) WHERE est_minutes IS NULL AND task_id IN (SELECT id FROM tasks)")
+        self._conn.execute("UPDATE usage SET kind = 'plan' WHERE kind IS NULL AND task_id = '_plan'")
 
     def close(self) -> None:
         self._conn.close()
@@ -155,6 +172,14 @@ class Store:
             "VALUES(?,?,?,?,?,?)",
             (task_id, attempt, input_hash, output_hash, json.dumps(data), time.time()),
         )
+
+    def latest_event(self, type_: str) -> Optional[dict]:
+        r = self._conn.execute("SELECT * FROM events WHERE type=? ORDER BY seq DESC LIMIT 1", (type_,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"]) if d.get("payload") else {}
+        return d
 
     def latest_handoff(self, task_id: str) -> Optional[dict]:
         r = self._conn.execute(
@@ -224,12 +249,16 @@ class Store:
     # ----------------------------------------------------------------- usage
     def add_usage(self, task_id: str, attempt: int, worker: str, ok: bool, *, model: Optional[str] = None,
                   input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0,
-                  cost_usd: float = 0.0, seconds: float = 0.0, est_minutes: Optional[float] = None) -> None:
+                  cost_usd: float = 0.0, seconds: float = 0.0, est_minutes: Optional[float] = None,
+                  kind: Optional[str] = None) -> None:
+        if kind is None:
+            r = self._conn.execute("SELECT kind FROM tasks WHERE id=?", (task_id,)).fetchone()
+            kind = r["kind"] if r else ("plan" if task_id == "_plan" else None)
         self._conn.execute(
             "INSERT INTO usage(task_id,attempt,worker,model,input_tokens,output_tokens,cache_read_tokens,"
-            "cost_usd,seconds,ok,est_minutes) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "cost_usd,seconds,ok,est_minutes,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, attempt, worker, model, input_tokens, output_tokens, cache_read_tokens,
-             cost_usd, seconds, int(ok), est_minutes),
+             cost_usd, seconds, int(ok), est_minutes, kind),
         )
 
     def usage_totals(self) -> dict:
@@ -243,9 +272,9 @@ class Store:
 
     def usage_by_kind(self) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT t.kind, COUNT(*) runs, AVG(u.input_tokens+u.output_tokens) avg_tokens, "
-            "AVG(u.seconds) avg_seconds, AVG(u.ok) success_rate FROM usage u JOIN tasks t ON t.id=u.task_id "
-            "GROUP BY t.kind"
+            "SELECT u.kind kind, COUNT(*) runs, AVG(u.input_tokens+u.output_tokens) avg_tokens, "
+            "AVG(u.seconds) avg_seconds, AVG(u.ok) success_rate FROM usage u "
+            "WHERE u.kind IS NOT NULL AND u.kind != 'plan' GROUP BY u.kind"
         ).fetchall()
         out = [dict(r) for r in rows]
         ratios = {r["kind"]: r for r in self.est_ratio_by_kind()}
@@ -255,15 +284,38 @@ class Store:
             r["est_tasks"] = e["tasks"] if e else 0
         return out
 
+    def history_by_kind(self, min_samples: int = 3) -> dict[str, dict]:
+        """Planner calibration: per kind, median worker seconds per run (runs whose CLI started) and median
+        actual/est per task. A statistic is omitted when it has fewer than `min_samples` samples."""
+        runs: dict[str, list[float]] = {}
+        for r in self._conn.execute("SELECT kind, seconds FROM usage WHERE kind IS NOT NULL AND kind != 'plan' "
+                                    "AND model IS NOT NULL"):
+            runs.setdefault(r["kind"], []).append(r["seconds"])
+        ratios: dict[str, list[float]] = {}
+        for r in self._conn.execute(
+                "SELECT MAX(kind) kind, SUM(seconds) / 60.0 / MAX(est_minutes) ratio FROM usage "
+                "WHERE kind IS NOT NULL AND kind != 'plan' AND est_minutes > 0 GROUP BY task_id"):
+            ratios.setdefault(r["kind"], []).append(r["ratio"])
+        out: dict[str, dict] = {}
+        for kind in sorted(set(runs) | set(ratios)):
+            d = {}
+            if len(runs.get(kind, [])) >= min_samples:
+                d["median_seconds"], d["runs"] = round(_median(runs[kind]), 1), len(runs[kind])
+            if len(ratios.get(kind, [])) >= min_samples:
+                d["median_actual_over_est"], d["tasks"] = round(_median(ratios[kind]), 3), len(ratios[kind])
+            if d:
+                out[kind] = d
+        return out
+
     def est_ratio_by_kind(self) -> list[dict]:
         """Actual worker minutes / planner est_minutes per task kind. Per task, every attempt (and merge
         agent run) counts towards the actual time; the estimate counts once. Rows without an estimate
         (runs recorded before v0.2.7, planner calls) are skipped."""
         rows = self._conn.execute(
-            "SELECT t.kind, COUNT(*) tasks, SUM(x.actual_min) actual_min, SUM(x.est) est_min, "
+            "SELECT x.kind kind, COUNT(*) tasks, SUM(x.actual_min) actual_min, SUM(x.est) est_min, "
             "SUM(x.actual_min) / SUM(x.est) ratio FROM ("
-            "  SELECT task_id, SUM(seconds) / 60.0 actual_min, MAX(est_minutes) est FROM usage "
-            "  WHERE est_minutes IS NOT NULL AND est_minutes > 0 GROUP BY task_id"
-            ") x JOIN tasks t ON t.id = x.task_id GROUP BY t.kind"
+            "  SELECT task_id, MAX(kind) kind, SUM(seconds) / 60.0 actual_min, MAX(est_minutes) est FROM usage "
+            "  WHERE est_minutes IS NOT NULL AND est_minutes > 0 AND kind IS NOT NULL GROUP BY task_id"
+            ") x GROUP BY x.kind"
         ).fetchall()
         return [dict(r) for r in rows]

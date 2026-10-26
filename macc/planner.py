@@ -97,6 +97,9 @@ Rules for commands in `done_when` / `integration_gates`:
   and own it. Do not assume an empty repository.
 - If a check must verify "stdlib only", test against `sys.stdlib_module_names`, never a hand-written list.
 
+# Measured history in this repo (worker time per run, from macc's usage table)
+{HISTORY}
+
 # Feature to plan
 {DESCRIPTION}
 """
@@ -197,6 +200,23 @@ def validate_plan(data: dict) -> TaskGraph:
     return g
 
 
+def format_history(history: Optional[dict]) -> str:
+    """Calibration lines for the planner; kinds with too few samples are already left out by the store."""
+    if not history:
+        return "- (no history yet: estimate as usual)"
+    lines = []
+    for kind, h in sorted(history.items()):
+        bits = []
+        if "median_seconds" in h:
+            bits.append(f"median {h['median_seconds']:.0f} s of worker time per run ({h['runs']} runs)")
+        if "median_actual_over_est" in h:
+            bits.append(f"median actual/est_minutes = {h['median_actual_over_est']:.3f} ({h['tasks']} tasks)")
+        lines.append(f"- {kind}: " + "; ".join(bits))
+    lines.append("Set est_minutes from these medians (actual worker minutes), not from how long a human would take. "
+                 "A ratio far below 1 means past estimates were too high.")
+    return "\n".join(lines)
+
+
 @dataclass
 class PlanResult:
     graph: TaskGraph
@@ -207,7 +227,8 @@ class PlanResult:
 
 async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: Path,
                         effort: str = "high", model: Optional[str] = None, max_rounds: int = 2,
-                        existing_files: Optional[list[str]] = None, current_gate: str = "") -> PlanResult:
+                        existing_files: Optional[list[str]] = None, current_gate: str = "",
+                        history: Optional[dict] = None) -> PlanResult:
     """Call the planner worker inside `workdir` (the integration worktree, where workers will run);
     on validation failure feed the error back once. Returns the graph plus non-fatal warnings."""
     files = existing_files if existing_files is not None else sorted(
@@ -218,7 +239,8 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
         listing += f"\n- ... {len(files) - 300} more"
     prompt = (PLANNER_PROMPT.replace("{BEGIN}", PLAN_BEGIN).replace("{END}", PLAN_END)
               .replace("{DESCRIPTION}", description).replace("{FILES}", listing)
-              .replace("{GATE}", current_gate or "(none configured)"))
+              .replace("{GATE}", current_gate or "(none configured)")
+              .replace("{HISTORY}", format_history(history)))
     task = Task(id="_plan", title="plan", kind="plan", effort=effort, model=model, owns=[])
     last_err = ""
     usage = []

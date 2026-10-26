@@ -230,7 +230,7 @@ async def test_review_reject_reopens_reviewed_tasks(repo):
     assert ("review_rejected", "review") in events
     # the re-run of impl saw the review notes
     ctx = (repo.macc_dir / "context" / "impl.md").read_text()
-    assert "review rejected" in ctx and "needs tests" in ctx
+    assert "Review round 1 rejected" in ctx and "needs tests" in ctx   # via decision record
     assert any(d["title"].startswith("Review round") for d in store.decisions())
 
 

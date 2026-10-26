@@ -11,6 +11,11 @@ Graph, store, worktrees, handoffs, scheduler, CLI, mock worker, 32 tests.
 - [x] Ownership PreToolUse guard injected via `--settings` (MACC_OWNS); exit 2 blocks out-of-scope edits.
 - [x] Broken-baseline gates -> BLOCKED without charging an attempt.
 - [x] `macc events --follow`.
+- [x] Two real runs on the toy repo (plan3: 9 tasks, 97→124 tests, $6.85 over two rounds incl. a change cycle).
+- [x] v0.2.2 from the operator's findings: scoped commits (owned paths only, artifacts discarded,
+      out-of-scope = failure), transient CLI failures not charged, prompt via argv, `merge_after`
+      soft ordering (run in parallel, merge in order), review `REOPEN:` line, hash refresh on first
+      completion, cumulative cost budget, `macc change --owns/--done-when`.
 - [ ] Real-repo trial on one of Kelvin's projects; collect per-kind usage for the cost model.
 
 ## v0.3 — impact analysis and cost model

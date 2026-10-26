@@ -28,7 +28,12 @@ state. macc moves scheduling into a plain program and calls the model only to do
 - **Independent review with teeth**: a `review` task's REJECT reopens the reviewed tasks with the notes; the
   loop is bounded by the review task's `max_attempts`.
 - **Merge agent**: textual conflicts go to a worker that sees only the conflicting files plus both handoffs.
-- **Broken environment ≠ broken task**: a gate that fails on the baseline blocks the task without charging an attempt.
+- **Broken environment ≠ broken task**: a gate that fails on the baseline blocks the task without charging an attempt;
+  CLI start-up failures (stdin race, rate limit) are retried without charging either.
+- **Scoped commits**: only owned paths are committed; build artifacts are discarded; anything else a worker
+  touched (e.g. via Bash) fails the attempt.
+- **`merge_after`**: tests run in parallel with the implementation but merge only after it, so the
+  integration gate never runs new tests against old code.
 
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other.
 - **Contract-first**: tasks of kind `contract` must precede anything touching the same paths.
@@ -91,6 +96,11 @@ tasks:
   - id: backend
     deps: [contract]
     owns: ["server/**"]
+    spec: ...
+  - id: backend_tests
+    deps: [contract]
+    merge_after: [backend]    # runs now, merges once backend is in
+    owns: ["tests/server/**"]
     spec: ...
 ```
 

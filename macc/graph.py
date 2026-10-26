@@ -65,6 +65,7 @@ class Task:
     # --- mutable runtime fields ---
     state: str = State.PENDING.value
     attempts: int = 0
+    transients: int = 0                                  # infra failures (not charged, but bounded)
     input_hash: str = ""
     output_hash: Optional[str] = None
     preempt: bool = False                                # set when inputs changed mid-run
@@ -118,6 +119,9 @@ class TaskGraph:
                     raise GraphError(f"{t.id} merge_after unknown task {d}")
                 if d in t.deps:
                     raise GraphError(f"{t.id}: {d} is already a hard dep; merge_after is redundant")
+                if self.owns_overlap(t, self.tasks[d]):
+                    raise GraphError(f"{t.id} merge_after {d} but their `owns` overlap: while {t.id} waits to "
+                                     f"merge it holds those paths and {d} could never start (use deps instead)")
         self.topo_order()  # raises on cycle
         # deps + merge_after together must also be acyclic (merge order is a DAG too)
         combined = {k: set(t.deps) | set(t.merge_after) for k, t in self.tasks.items()}

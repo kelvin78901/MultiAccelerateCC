@@ -158,3 +158,19 @@ def test_commit_scoped_no_owns_means_everything(repo):
     (wa / "z.txt").write_text("z\n")
     sc = repo.commit_scoped(wa, "a", [])
     assert sc.committed and sc.inside == ["z.txt"] and not sc.outside
+
+
+def test_artifact_matching_by_segment():
+    from macc.worktree import _is_artifact
+    assert _is_artifact("build/out.js") and _is_artifact("a/__pycache__/x.pyc") and _is_artifact("x.log")
+    assert not _is_artifact("tools/rebuild/x.py") and not _is_artifact("distribute.py") and not _is_artifact("src/builder.py")
+
+
+def test_dirty_paths_handles_unicode_and_spaces(repo):
+    repo.ensure_integration()
+    wa = repo.create_task_worktree("a")
+    (wa / "数据 文件.txt").write_text("x\n")
+    (wa / "README.md").write_text("changed\n")
+    assert set(repo.dirty_paths(wa)) == {"数据 文件.txt", "README.md"}
+    sc = repo.commit_scoped(wa, "a", ["数据 文件.txt"])
+    assert sc.inside == ["数据 文件.txt"] and sc.outside == ["README.md"]

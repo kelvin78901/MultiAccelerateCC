@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -56,8 +57,11 @@ class ClaudeWorker:
         return shutil.which(self.binary) is not None
 
     ARGV_PROMPT_LIMIT = 100_000     # bytes; larger prompts go through stdin
-    TRANSIENT_MARKERS = ("no stdin data", "Input must be provided", "rate limit", "overloaded",
-                         "529", "ECONNRESET", "ETIMEDOUT", "fetch failed")
+    # matched against stderr (and the result text when the CLI itself reports is_error), never plain stdout
+    TRANSIENT_RE = re.compile(
+        r"no stdin data|Input must be provided|rate.?limit|overloaded_error|"
+        r"(?:status|error|code)\D{0,10}5(?:29|03|02)\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|fetch failed|"
+        r"Connection (?:reset|refused)|socket hang up", re.I)
 
     def _cmd(self, task: Task, prompt_in_argv: Optional[str] = None) -> list[str]:
         cmd = [self.binary, "-p"]
@@ -136,9 +140,11 @@ class ClaudeWorker:
         secs = time.time() - t0
         text = out.decode(errors="replace")
         err_text = err.decode(errors="replace")
-        transient = proc.returncode != 0 and any(m.lower() in (err_text + text).lower() for m in self.TRANSIENT_MARKERS)
+        transient = proc.returncode != 0 and bool(self.TRANSIENT_RE.search(err_text))
         try:
             data = json.loads(text)
+            if isinstance(data, dict) and data.get("is_error") and self.TRANSIENT_RE.search(str(data.get("result", ""))):
+                transient = True
         except json.JSONDecodeError:
             return WorkerResult(ok=proc.returncode == 0, output_text=text, fields=parse_worker_output(text),
                                 seconds=secs, transient=transient,

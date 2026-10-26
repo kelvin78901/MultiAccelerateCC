@@ -419,3 +419,53 @@ async def test_cost_budget_is_cumulative_across_runs(repo):
     assert s.cost_used == 0.0
     summary = await s.run()
     assert summary["finished"]
+
+
+async def test_orphaned_active_tasks_reset_on_restart(repo):
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph([Task("a", "a", owns=["a/**"]), Task("b", "b", owns=["b/**"], merge_after=["a"])]); g.validate()
+    g.tasks["a"].state = State.RUNNING.value; g.tasks["a"].attempts = 1
+    g.tasks["b"].state = State.REVIEW.value; g.tasks["b"].attempts = 1      # was awaiting merge when we died
+    store.save_graph(g)
+    events = []
+    s = Scheduler(repo, store, store.load_graph(), MockWorker(), on_event=lambda t, tid, p: events.append((t, tid)))
+    summary = await s.run()
+    assert summary["finished"]
+    assert ("orphan_reset", "a") in events and ("orphan_reset", "b") in events
+    assert s.graph.tasks["a"].attempts == 1 and s.graph.tasks["b"].attempts == 1   # not double-charged
+
+
+async def test_transient_failures_are_bounded(repo):
+    from macc.workers import WorkerResult
+
+    async def always_transient(task, wt, pack):
+        return WorkerResult(ok=False, error="rate limit", transient=True)
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph([Task("t", "t", owns=["a/**"])]); g.validate()
+    events = []
+    cfg = SchedulerConfig(max_transients=2)
+    s = Scheduler(repo, store, g, always_transient, cfg, on_event=lambda t, tid, p: events.append((t, tid)))
+    await s.run()
+    assert g.tasks["t"].state == State.BLOCKED.value and g.tasks["t"].transients == 3
+    assert ("transient_limit", "t") in events
+    assert [e for e, _ in events].count("transient_failure") == 2
+
+
+async def test_parked_tasks_reset_when_run_ends_early(repo):
+    """budget stops dispatch of the merge_after target -> parked task must not be left in REVIEW."""
+    tasks = [
+        Task("impl", "impl", owns=["src/**"], est_tokens=5000),
+        Task("tests", "tests", merge_after=["impl"], owns=["tests/**"], est_tokens=10),
+    ]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=1, token_budget=2000)
+    assert summary["stopped_reason"] == "budget_exceeded"
+    assert g.tasks["tests"].state == State.PENDING.value
+    assert ("parked_reset", "tests") in events
+
+
+def test_merge_after_owns_overlap_rejected():
+    import pytest as _pt
+    from macc.graph import GraphError
+    g = TaskGraph([Task("a", "a", owns=["x/**"]), Task("b", "b", merge_after=["a"], owns=["x/y/**"])])
+    with _pt.raises(GraphError, match="overlap"):
+        g.validate()

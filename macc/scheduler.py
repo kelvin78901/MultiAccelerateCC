@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from .graph import Kind, State, Task, TaskGraph
+from .graph import ACTIVE, Kind, State, Task, TaskGraph
 from .handoff import build_context_pack, generate_handoff, merge_conflict_spec, parse_reopen, parse_verdict
 from .store import Store
 from .workers import WorkerFn, WorkerResult
@@ -37,6 +37,7 @@ class SchedulerConfig:
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
     cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
+    max_transients: int = 4                      # infra failures tolerated per task before BLOCKED
 
 
 EventFn = Callable[[str, Optional[str], dict], None]
@@ -160,12 +161,20 @@ class Scheduler:
             self._cleanup(tid)
             return
 
-        if not res.ok and res.transient and t.attempts <= t.max_attempts + 2:
-            # infrastructure hiccup (CLI start, stdin race, rate limit): not the task's fault
+        if not res.ok and res.transient:
+            # infrastructure hiccup (CLI start, stdin race, rate limit): not the task's fault, but bounded
+            t.transients += 1
             t.attempts = max(0, t.attempts - 1)
-            t.state = State.PENDING.value
-            self._persist(tid)
-            self.emit("transient_failure", tid, error=(res.error or "")[:300])
+            if t.transients > self.cfg.max_transients:
+                t.state = State.BLOCKED.value
+                t.last_error = f"{t.transients} infrastructure failures in a row: {(res.error or '')[:500]}"
+                self._persist(tid)
+                self.emit("transient_limit", tid, count=t.transients)
+            else:
+                t.state = State.PENDING.value
+                self._persist(tid)
+                self.emit("transient_failure", tid, count=t.transients, error=(res.error or "")[:300])
+                await asyncio.sleep(min(30.0, 2.0 ** t.transients))   # back off before re-dispatch
             self._cleanup(tid)
             return
         if not res.ok:
@@ -307,6 +316,7 @@ class Scheduler:
         # 6. done + staleness propagation
         self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
         t.last_error = None
+        t.transients = 0
         changed = self.graph.mark_done(tid, out_hash)
         self._persist(tid, *changed)
         self.emit("done", tid, output_hash=out_hash, files=len(handoff["files_changed"]), stale=changed)
@@ -413,8 +423,21 @@ class Scheduler:
             self._persist(t.id)
 
     # ---------------------------------------------------------------- main
+    def _reset_orphans(self) -> None:
+        """A previous run died (or exited) while tasks were RUNNING/awaiting merge. Their worktrees and
+        results are not durable, so they go back to PENDING without being charged an attempt."""
+        for t in self.graph.tasks.values():
+            if t.state in {s.value for s in ACTIVE} and t.id not in self.running and t.id not in self.parked:
+                t.state = State.PENDING.value
+                t.attempts = max(0, t.attempts - 1)
+                t.preempt = False
+                self._persist(t.id)
+                self.emit("orphan_reset", t.id, reason="active in a previous run that did not finish")
+                self._cleanup(t.id)
+
     async def run(self) -> dict:
         self.repo.ensure_integration()
+        self._reset_orphans()
         self.graph.refresh_hashes()
         self._persist()
         self.emit("run_started", None, tasks=len(self.graph.tasks), max_parallel=self.cfg.max_parallel)
@@ -433,6 +456,15 @@ class Scheduler:
                 tid, wt, res = fut.result()
                 await self._on_finished(tid, wt, res)
             await self._try_parked()
+        # anything still parked cannot be merged in this run (targets stuck); do not leave it in REVIEW
+        for tid in list(self.parked):
+            self.parked.pop(tid)
+            t = self.graph.tasks[tid]
+            t.state = State.PENDING.value
+            t.attempts = max(0, t.attempts - 1)
+            self._persist(tid)
+            self.emit("parked_reset", tid, after=t.merge_after)
+            self._cleanup(tid)
         summary = {
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),

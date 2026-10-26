@@ -25,13 +25,18 @@ class GitError(RuntimeError):
     pass
 
 
-ARTIFACT_PATTERNS = ("__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", "node_modules/",
-                     ".gradle/", "build/", "dist/", ".DS_Store", ".coverage")
+ARTIFACT_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules",
+                 ".gradle", "build", "dist", ".tox", ".nox", "target"}
+ARTIFACT_FILES = {".DS_Store", ".coverage"}
 ARTIFACT_SUFFIXES = (".pyc", ".pyo", ".class", ".o", ".log")
 
 
 def _is_artifact(p: str) -> bool:
-    return any(seg in p for seg in ARTIFACT_PATTERNS) or p.endswith(ARTIFACT_SUFFIXES)
+    """Match whole path segments only: `build/x` yes, `tools/rebuild/x.py` no."""
+    parts = p.split("/")
+    if any(seg in ARTIFACT_DIRS for seg in parts[:-1]):
+        return True
+    return parts[-1] in ARTIFACT_FILES or p.endswith(ARTIFACT_SUFFIXES)
 
 
 def _path_in_glob(p: str, g: str) -> bool:
@@ -143,13 +148,20 @@ class Repo:
 
     def dirty_paths(self, path: Path) -> list[str]:
         """Modified/added/deleted/untracked paths relative to the worktree root."""
-        out = self.git("status", "--porcelain", "--untracked-files=all", cwd=path).stdout
+        # -z: NUL-separated, no quoting/escaping of unicode or spaces; renames give two records
+        out = self.git("status", "--porcelain", "-z", "--untracked-files=all", cwd=path).stdout
+        records = out.split("\0")
         paths = []
-        for line in out.splitlines():
-            p = line[3:]
-            if " -> " in p:
-                p = p.split(" -> ", 1)[1]
-            paths.append(p.strip().strip('"'))
+        i = 0
+        while i < len(records):
+            rec = records[i]
+            i += 1
+            if not rec:
+                continue
+            status, p = rec[:2], rec[3:]
+            if "R" in status or "C" in status:   # rename/copy: next record is the original path
+                i += 1
+            paths.append(p)
         return paths
 
     def commit_scoped(self, path: Path, message: str, owns: list[str]) -> "ScopedCommit":

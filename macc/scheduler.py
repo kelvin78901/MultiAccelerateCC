@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .graph import Kind, State, Task, TaskGraph
-from .handoff import build_context_pack, generate_handoff, merge_conflict_spec
+from .handoff import build_context_pack, generate_handoff, merge_conflict_spec, parse_verdict
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -52,6 +52,7 @@ class Scheduler:
         self.running: dict[str, asyncio.Task] = {}
         self.tokens_used = 0
         self.cost_used = 0.0
+        self.runs_done = 0
         if hasattr(worker, "gate_commands"):
             worker.gate_commands = list(self.cfg.integration_gates)
         self.stopped_reason: Optional[str] = None
@@ -76,8 +77,11 @@ class Scheduler:
             return "wip_limit"
         if self.cfg.token_budget is not None and self.tokens_used + t.est_tokens > self.cfg.token_budget:
             return "budget"
-        if self.cfg.cost_budget_usd is not None and self.cost_used >= self.cfg.cost_budget_usd:
-            return "budget"
+        if self.cfg.cost_budget_usd is not None:
+            # reserve for tasks already running: assume each costs the average of this run so far
+            avg = self.cost_used / self.runs_done if self.runs_done else 0.0
+            if self.cost_used + (len(self.running) + 1) * avg > self.cfg.cost_budget_usd:
+                return "budget"
         conflicts = self.graph.conflicts_with_active(t)
         if conflicts:
             return f"ownership_conflict:{','.join(conflicts)}"
@@ -138,6 +142,7 @@ class Scheduler:
         self.running.pop(tid, None)
         self.tokens_used += res.input_tokens + res.output_tokens
         self.cost_used += res.cost_usd
+        self.runs_done += 1
         self.store.add_usage(tid, t.attempts, self._worker_name(), res.ok, model=res.model,
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds)
@@ -180,7 +185,7 @@ class Scheduler:
             self.store.add_debt(tid, "stub", str(s))
         if stubs and not t.allow_stubs:
             self.emit("stub_without_permission", tid, stubs=stubs)
-        if t.kind == Kind.REVIEW.value and "REJECT" in (res.fields.get("notes_for_downstream", "").upper()):
+        if t.kind == Kind.REVIEW.value and parse_verdict(res.fields.get("notes_for_downstream", "")) == "REJECT":
             self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
             self._review_reject(t, res.fields.get("notes_for_downstream", ""))
             self._cleanup(tid)

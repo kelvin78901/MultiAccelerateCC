@@ -83,13 +83,21 @@ def cmd_plan(a) -> int:
     # keep runtime state for tasks that already exist and whose spec did not change
     for t in g.tasks.values():
         old = existing.tasks.get(t.id)
-        if old and old.spec == t.spec and sorted(old.deps) == sorted(t.deps):
+        if old and old.spec == t.spec and sorted(old.deps) == sorted(t.deps) \
+                and old.done_when == t.done_when and sorted(old.owns) == sorted(t.owns):
             for k in ("state", "attempts", "output_hash", "input_hash", "last_error"):
                 setattr(t, k, getattr(old, k))
-    g.refresh_hashes()
-    for old_id in existing.tasks:
-        if old_id not in g.tasks:
+    # tasks from earlier plans stay in the store when finished (history + handoffs);
+    # unfinished ones not in the new plan are dropped unless --keep-all
+    for old_id, old in existing.tasks.items():
+        if old_id in g.tasks:
+            continue
+        if old.state == State.DONE.value or a.keep_all:
+            g.add(old)
+        else:
             store.delete_task(old_id)
+    g.validate()
+    g.refresh_hashes()
     store.save_graph(g)
     if cfg:
         (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -238,6 +246,7 @@ def main(argv=None) -> int:
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")
     sp.add_argument("--model", default=None); sp.add_argument("--effort", default="high")
     sp.add_argument("--timeout", type=int, default=900)
+    sp.add_argument("--keep-all", action="store_true", help="keep unfinished tasks from earlier plans too")
     sp.set_defaults(fn=cmd_plan)
     sp = sub.add_parser("run")
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")

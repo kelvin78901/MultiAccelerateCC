@@ -26,6 +26,23 @@ API_PATTERNS = re.compile(
 STUB_PATTERNS = re.compile(r"NotImplemented|TODO\(macc\)|MACC_STUB|raise NotImplementedError|throw UnsupportedOperationException", re.I)
 
 
+NON_CODE_EXT = {".md", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml", ".csv", ".html"}
+
+
+def _is_code_file(path: Optional[str]) -> bool:
+    """Docs and data files can legitimately *mention* stub markers (e.g. a review saying 'no TODO(macc)')."""
+    if not path:
+        return False
+    return Path(path).suffix.lower() not in NON_CODE_EXT
+
+
+def parse_verdict(notes: str) -> Optional[str]:
+    """APPROVE / REJECT only when stated as a verdict: at the start of a line, optionally after 'VERDICT:'.
+    A sentence like 'no reason to reject' does not count."""
+    m = re.search(r"(?im)^\s*(?:\*\*)?(?:verdict\s*[:：]\s*)?(?:\*\*)?\s*(APPROVE|REJECT)\b", notes or "")
+    return m.group(1).upper() if m else None
+
+
 def parse_worker_output(text: str) -> dict:
     """Extract the JSON block the worker emits between markers. Tolerant of missing/invalid blocks."""
     m = re.search(re.escape(HANDOFF_BEGIN) + r"(.*?)" + re.escape(HANDOFF_END), text, re.S)
@@ -52,7 +69,7 @@ def generate_handoff(repo: Repo, task: Task, wt_path: Path, gate_results: list[d
     for line in diff.splitlines():
         if line.startswith("+++ "):
             cur_file = line[6:] if line.startswith("+++ b/") else line[4:]
-        elif line.startswith("+") and STUB_PATTERNS.search(line):
+        elif line.startswith("+") and STUB_PATTERNS.search(line) and _is_code_file(cur_file):
             stub_hits.append({"path": cur_file, "line": line[1:].strip()[:160]})
     return {
         "task_id": task.id,
@@ -154,14 +171,18 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         parts.append("# Spike output\nDo not write production code. Write your conclusion to "
                      "`docs/spikes/" + task.id + ".md` and summarise it in notes_for_downstream.")
     if task.kind == "contract":
+        downstream = [graph.tasks[d] for d in sorted(graph.descendants(task.id))]
+        owned = "\n".join(f"- {d.id}: {d.owns}" for d in downstream if d.owns)
         parts.append("# Contract output\nProduce interfaces/schemas/test plans only. Downstream tasks will "
-                     "be written against exactly what you commit. Be explicit about types and error cases.")
+                     "be written against exactly what you commit. Be explicit about types and error cases.\n"
+                     "The plan already fixes which files each downstream task owns; use EXACTLY these paths "
+                     "and module names in the contract (do not invent other file names):\n" + owned)
     if task.kind == "merge":
         parts.append("# Merge output\nThe files listed under `owns` contain git conflict markers "
                      "(<<<<<<< HEAD is this task's version, >>>>>>> is the integration branch). Resolve every "
                      "marker so that BOTH intents survive. Touch no other file. Run done_when once at the end.")
     if task.kind == "review":
         parts.append("# Review output\nDo not edit code. Read the diff and tests. Report: root-cause fixes vs "
-                     "symptom fixes, missing tests, ownership violations, hidden stubs. Verdict in notes_for_downstream: "
-                     "APPROVE or REJECT with reasons.")
+                     "symptom fixes, missing tests, ownership violations, hidden stubs. notes_for_downstream MUST start "
+                     "with a line `VERDICT: APPROVE` or `VERDICT: REJECT`, followed by reasons.")
     return "\n\n".join(parts) + "\n"

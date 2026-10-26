@@ -70,9 +70,10 @@ class ClaudeWorker:
             for cmd_line in list(task.done_when) + list(self.gate_commands):
                 head = cmd_line.strip().split()
                 if head:
-                    if head[0] in ("python", "python3", "uv") and len(head) > 2 and head[1] == "-m":
-                        prefix = " ".join(head[:3])          # python -m pytest
-                    elif head[0] in ("bash", "sh", "make", "npm", "npx", "uv", "cargo", "go", "./gradlew"):
+                    base = os.path.basename(head[0])
+                    if base.startswith("python") and len(head) > 2 and head[1] == "-m":
+                        prefix = " ".join(head[:3])          # python -m pytest  (also /abs/venv/bin/python -m pytest)
+                    elif base in ("bash", "sh", "make", "npm", "npx", "uv", "cargo", "go", "gradlew"):
                         prefix = " ".join(head[:2])          # bash script.sh / npm test / make check
                     else:
                         prefix = head[0]                     # ruff / pytest / tsc

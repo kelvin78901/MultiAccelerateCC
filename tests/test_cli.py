@@ -61,3 +61,15 @@ def test_cli_split_and_retry(repo_dir, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "summary: {'done': 4}" in out
     assert main(["--repo", r, "retry", "after"]) == 0
+
+
+def test_plan_reload_keeps_finished_tasks(repo_dir, tmp_path, capsys):
+    r = str(repo_dir)
+    p1 = tmp_path / "p1.yaml"; p1.write_text("tasks:\n  - {id: a, title: a, owns: ['a/**']}\n")
+    p2 = tmp_path / "p2.yaml"; p2.write_text("tasks:\n  - {id: b, title: b, owns: ['b/**']}\n")
+    main(["--repo", r, "init"]); main(["--repo", r, "plan", str(p1)])
+    assert main(["--repo", r, "run", "--worker", "mock"]) == 0
+    main(["--repo", r, "plan", str(p2)])
+    main(["--repo", r, "status"])
+    out = capsys.readouterr().out
+    assert "done      code      a" in out and "pending   code      b" in out

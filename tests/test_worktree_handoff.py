@@ -113,3 +113,24 @@ def test_generate_handoff_and_context_pack(repo, tmp_path):
     assert pack.index("# Project rules") < pack.index("# How you work") < pack.index("# Your task")
     assert "pay() is a stub" in pack and "No real payments" in pack and "STUBS" in pack
     assert "['ui/**']" in pack
+
+
+def test_parse_verdict_is_strict():
+    from macc.handoff import parse_verdict
+    assert parse_verdict("VERDICT: APPROVE\nno reason to reject") == "APPROVE"
+    assert parse_verdict("**Verdict: REJECT** missing tests") == "REJECT"
+    assert parse_verdict("REJECT\nbecause") == "REJECT"
+    assert parse_verdict("I see no reason to reject this.") is None
+    assert parse_verdict("") is None
+
+
+def test_stub_detection_ignores_docs(repo, tmp_path):
+    repo.ensure_integration()
+    wa = repo.create_task_worktree("a")
+    (wa / "docs").mkdir()
+    (wa / "docs" / "review.md").write_text("Checked: no TODO(macc) markers, no NotImplementedError.\n")
+    (wa / "x.py").write_text("def f():\n    raise NotImplementedError  # TODO(macc)\n")
+    repo.commit_all(wa, "a")
+    t = Task("a", "A", owns=["docs/**", "x.py"])
+    h = generate_handoff(repo, t, wa, [], {})
+    assert [s["path"] for s in h["stubs_detected"]] == ["x.py"]

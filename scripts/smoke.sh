@@ -9,7 +9,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${1:-$HOME/macc-smoke}"
 MACC="$HERE/.venv/bin/macc"
-[ -x "$MACC" ] || { echo "run: cd $HERE && uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev]'"; exit 2; }
+# (re)create the venv if missing or built for another OS (e.g. inside a Linux sandbox)
+if ! "$HERE/.venv/bin/python" -c "import macc" >/dev/null 2>&1; then
+  rm -rf "$HERE/.venv"
+  python3 -m venv "$HERE/.venv"
+  "$HERE/.venv/bin/pip" install -q -e "$HERE[dev]"
+fi
 command -v claude >/dev/null || { echo "claude not on PATH"; exit 2; }
 
 rm -rf "$TARGET"; mkdir -p "$TARGET"; cd "$TARGET"

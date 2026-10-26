@@ -39,8 +39,12 @@ def _is_code_file(path: Optional[str]) -> bool:
 def parse_verdict(notes: str) -> Optional[str]:
     """APPROVE / REJECT only when stated as a verdict: at the start of a line, optionally after 'VERDICT:'.
     A sentence like 'no reason to reject' does not count."""
-    m = re.search(r"(?im)^\s*(?:\*\*)?(?:verdict\s*[:：]\s*)?(?:\*\*)?\s*(APPROVE|REJECT)\b", notes or "")
-    return m.group(1).upper() if m else None
+    m = re.search(r"(?im)^\s*(?:\*\*)?(?:verdict\s*[:：]\s*)?(?:\*\*)?\s*(APPROVE|REJECT|REQUEST(?:ED)?\s+CHANGES)\b",
+                  notes or "")
+    if not m:
+        return None
+    v = m.group(1).upper()
+    return "REJECT" if v.startswith("REQUEST") else v
 
 
 def parse_reopen(notes: str) -> list[str]:

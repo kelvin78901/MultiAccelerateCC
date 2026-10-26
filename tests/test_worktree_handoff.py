@@ -26,7 +26,9 @@ def repo(tmp_path) -> Repo:
 def test_worktree_lifecycle_and_merge(repo):
     ipath = repo.ensure_integration()
     assert ipath.exists() and repo.branch_exists(INTEGRATION_BRANCH)
-    assert ".macc/" in (repo.root / ".gitignore").read_text()
+    assert ".macc/" in (repo.root / ".git" / "info" / "exclude").read_text()
+    assert not (repo.root / ".gitignore").exists()                 # user's tree untouched
+    assert ".macc" not in repo.git("status", "--porcelain", "--ignored=no").stdout
 
     wa = repo.create_task_worktree("a")
     (wa / "a.py").write_text("def a():\n    return 1\n")
@@ -174,3 +176,9 @@ def test_dirty_paths_handles_unicode_and_spaces(repo):
     assert set(repo.dirty_paths(wa)) == {"数据 文件.txt", "README.md"}
     sc = repo.commit_scoped(wa, "a", ["数据 文件.txt"])
     assert sc.inside == ["数据 文件.txt"] and sc.outside == ["README.md"]
+
+
+def test_parse_verdict_accepts_request_changes():
+    from macc.handoff import parse_verdict
+    assert parse_verdict("**Verdict: REQUEST CHANGES.** needs tests") == "REJECT"
+    assert parse_verdict("Verdict: requested changes") == "REJECT"

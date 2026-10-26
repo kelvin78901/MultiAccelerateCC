@@ -99,14 +99,19 @@ class Repo:
         return self.integration_path
 
     def _ensure_gitignore(self) -> None:
-        gi = self.root / ".gitignore"
-        line = ".macc/"
-        existing = gi.read_text() if gi.exists() else ""
-        if line not in existing.splitlines():
-            with gi.open("a") as f:
+        """Ignore .macc/ via .git/info/exclude: no file appears in the user's tree, so nothing can
+        conflict when integration is merged back into main."""
+        git_dir = Path(self.git("rev-parse", "--git-common-dir").stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = self.root / git_dir
+        exclude = git_dir / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text() if exclude.exists() else ""
+        if ".macc/" not in existing.splitlines():
+            with exclude.open("a") as f:
                 if existing and not existing.endswith("\n"):
                     f.write("\n")
-                f.write(line + "\n")
+                f.write(".macc/\n")
 
     # ---------------------------------------------------------- task trees
     @staticmethod

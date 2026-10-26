@@ -55,4 +55,10 @@ def test_plan_warnings():
     joined = "\n".join(w)
     assert "bare python" in joined and "%%" in joined
     assert "backend: owns 'server/**' which already contains ['server/app.py']" in joined
-    assert "contract: owns" not in joined          # api/openapi.yaml exists but the spec names it -> fine
+    assert "contract: owns" in joined               # api/openapi.yaml exists; "Write api/openapi.yaml." never says modify/replace
+    g.tasks["contract"].spec = "Replace the existing api/openapi.yaml."
+    g.tasks["backend"].done_when = ["python3 -c 'import x'", "python3 -m py_compile a.py"]
+    w2 = "\n".join(plan_warnings(g, existing_files={"server/app.py", "api/openapi.yaml"}))
+    assert "contract: owns" not in w2 and "bare python" not in w2
+    g.tasks["review"].spec = "Write **Verdict: REQUEST CHANGES** or APPROVE"
+    assert "verdict vocabulary" in "\n".join(plan_warnings(g))

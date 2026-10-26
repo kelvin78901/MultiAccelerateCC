@@ -45,12 +45,20 @@ Inspect the repository (read-only) as needed before planning.
 10. Model per task: `model: sonnet` for ordinary code and tests; `model: opus` only for contract,
    integrate and review. Put `model: sonnet` in defaults.
 
+11. Review verdict vocabulary is fixed: the review task's spec must ask for `VERDICT: APPROVE` or
+    `VERDICT: REJECT` (nothing else), and its done_when must not grep for other words.
+12. A contract task's done_when must check structure (parse the schema file, import the interface
+    module), not grep for keywords you yourself chose.
+13. If the repository already contains some or all of what the description asks for, plan the delta
+    and say so in `config.scope_note` (one sentence). Never silently change the scope.
+
 # Output
 Emit exactly one YAML document between the markers, nothing else after it:
 {BEGIN}
 config:
   max_parallel: <int>
   cost_budget_usd: <float>
+  scope_note: "<only if the plan deviates from the description; else omit>"
   integration_gates: ["<command that runs the whole test suite>"]
 defaults:
   effort: medium
@@ -105,25 +113,42 @@ def extract_yaml(text: str) -> str:
 
 
 BARE_PY = re.compile(r"(?:^|[\s;&|(])python3?(?:\s|$)")
+PURE_STDLIB_USE = re.compile(r"python3?\s+(?:-c\s|-m\s+(?:py_compile|compileall|ast|json\.tool)\b)")
+MODIFY_WORDS = re.compile(r"\b(modify|modifies|extend|extends|replace|replaces|overwrite|overwrites|update|updates|"
+                          r"rewrite|rewrites|existing|already exists|refactor|edit|edits|append)\b", re.I)
+FOREIGN_VERDICTS = re.compile(r"request(?:ed)?\s+changes|needs?\s+work|LGTM|PASS\b|FAIL\b|ACCEPT\b|DECLINE", re.I)
 
 
 def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: list[str] | None = None) -> list[str]:
     """Non-fatal problems a human should see before running."""
     warns: list[str] = []
+    def bare(cmd: str) -> bool:
+        return bool(BARE_PY.search(cmd)) and not PURE_STDLIB_USE.search(cmd)
+
     for cmd in list(gates or []):
-        if BARE_PY.search(cmd):
+        if bare(cmd):
             warns.append(f"integration gate uses a bare python interpreter: {cmd!r}")
     for t in g.tasks.values():
         for cmd in t.done_when:
-            if BARE_PY.search(cmd):
-                warns.append(f"{t.id}: done_when uses a bare python interpreter: {cmd!r}")
+            if bare(cmd):
+                warns.append(f"{t.id}: done_when uses a bare python interpreter (not a pure-stdlib -c/-m py_compile use): {cmd!r}")
             if "%%" in cmd:
                 warns.append(f"{t.id}: done_when contains '%%' (no formatting is applied; probably a bug): {cmd!r}")
         if existing_files:
             for g_ in t.owns:
                 hits = sorted(f for f in existing_files if _glob_hit(f, g_))
-                if hits and not any(h in t.spec for h in hits) and not any(Path(h).name in t.spec for h in hits):
-                    warns.append(f"{t.id}: owns {g_!r} which already contains {hits[:3]} but the spec never mentions them")
+                if hits and not MODIFY_WORDS.search(t.spec):
+                    warns.append(f"{t.id}: owns {g_!r} which already contains {hits[:3]}, but the spec never says it "
+                                 "modifies/extends/replaces existing files (it would silently overwrite them)")
+        if t.kind == Kind.REVIEW.value:
+            blob = t.spec + " ".join(t.done_when)
+            if FOREIGN_VERDICTS.search(blob):
+                warns.append(f"{t.id}: review spec/done_when uses a verdict vocabulary other than APPROVE/REJECT; "
+                             "macc only acts on `VERDICT: APPROVE|REJECT` (REQUEST CHANGES is read as REJECT, "
+                             "but a done_when grepping for other words will fail)")
+        if t.kind == Kind.CONTRACT.value and t.done_when and all(("grep" in c or "test -f" in c) for c in t.done_when):
+            warns.append(f"{t.id}: contract done_when only greps/stat-checks its own output; prefer a structural check "
+                         "(parse the schema, import the stub module)")
     return warns
 
 

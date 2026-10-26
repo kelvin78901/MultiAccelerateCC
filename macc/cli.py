@@ -87,12 +87,23 @@ def cmd_plan(a) -> int:
         for tid in g.topo_order():
             t = g.tasks[tid]
             print(f"  {t.kind:<9} {t.id:<24} deps={t.deps} merge_after={t.merge_after} owns={t.owns} ~{t.est_minutes:.0f}min")
-        if pr.config.get("integration_gates"):
-            res = repo.run_gates(pr.config["integration_gates"])
-            bad = [r for r in res if not r["ok"]]
-            if bad:
-                pr.warnings.append(f"proposed integration gate FAILS on the current integration tree: {bad[0]['cmd']!r} "
-                                   f"-> every task would be BLOCKED (gate_broken_baseline)")
+        if pr.config.get("scope_note"):
+            print(f"\nSCOPE NOTE from planner: {pr.config['scope_note']}")
+        proposed = pr.config.get("integration_gates") or []
+        trusted = set(cfg_now.get("integration_gates", []))
+        if proposed:
+            # never execute model-written shell before a human saw it, unless it is the gate already in use
+            runnable = [c for c in proposed if c in trusted] if not a.check_gate else proposed
+            skipped = [c for c in proposed if c not in runnable]
+            if skipped:
+                pr.warnings.append("proposed integration gate(s) not executed (model-written, unreviewed): "
+                                   f"{skipped}. Inspect them, then re-run with --check-gate to verify on the baseline")
+            if runnable:
+                res = repo.run_gates(runnable)
+                bad = [r for r in res if not r["ok"]]
+                if bad:
+                    pr.warnings.append(f"proposed integration gate FAILS on the current integration tree: {bad[0]['cmd']!r} "
+                                       f"-> every task would be BLOCKED (gate_broken_baseline)")
         if pr.warnings:
             print("\nWARNINGS (fix before `macc plan`):")
             for w in pr.warnings:
@@ -277,6 +288,8 @@ def main(argv=None) -> int:
     sp.add_argument("--model", default=None); sp.add_argument("--effort", default="high")
     sp.add_argument("--timeout", type=int, default=900)
     sp.add_argument("--keep-all", action="store_true", help="keep unfinished tasks from earlier plans too")
+    sp.add_argument("--check-gate", action="store_true",
+                    help="with --from: execute the planner's proposed integration gate on the baseline (model-written shell!)")
     sp.set_defaults(fn=cmd_plan)
     sp = sub.add_parser("run")
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")

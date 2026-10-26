@@ -920,3 +920,63 @@ async def test_skipped_integrate_in_a_change_round_still_runs_the_review(repo):
                               on_event=lambda t, tid, p: events.append((t, tid))).run()
     assert ("integrate_skipped", "i") in events
     assert ("dispatched", "r") in events and summary["finished"], (summary, events)
+
+
+async def test_full_gate_result_survives_a_content_identical_merge_commit(repo):
+    # the gate ran on integration; then integration gets a new commit with identical files (as when it is
+    # fast-forwarded to a main that merged it with --no-ff): the review must still see a green gate
+    worker, w, seen = _recording_worker()
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(_review_plan()); g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"])
+    s = Scheduler(repo, store, g, w, cfg)
+    await s.run()
+    ipath = repo.integration_path
+    repo.git("commit", "-q", "--allow-empty", "-m", "merge commit, same tree", cwd=ipath)
+    s2 = Scheduler(repo, store, g, w, cfg)
+    assert s2._gate_covers_current_tree(store.latest_event("full_gate"))
+    assert s2._review_setup(g.tasks["r"], repo.head(ipath))[1].model == "sonnet"
+    (ipath / "src" / "new.py").write_text("x = 1\n")
+    repo.commit_all(ipath, "real change")
+    assert not s2._gate_covers_current_tree(store.latest_event("full_gate"))
+
+
+def _plan_with_new_tests(repo, test_body):
+    import sys
+    ipath = repo.ensure_integration()
+    base = repo.head(ipath)
+    (ipath / "tests").mkdir(exist_ok=True)
+    (ipath / "tests" / "test_new.py").write_text(test_body)
+    (ipath / "tests" / "test_old_untouched.txt").write_text("not a test\n")
+    repo.commit_all(ipath, "this plan added a test")
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph([Task("i", "i", kind=Kind.INTEGRATE.value)]); g.validate()
+    cfg = SchedulerConfig(integration_gates=[f"{sys.executable} -m pytest -q"], plan_base=base)
+    return Scheduler(repo, store, g, MockWorker(), cfg), store
+
+
+def test_flake_check_catches_seed_dependent_new_tests(repo):
+    s, store = _plan_with_new_tests(repo, "import os\n\ndef test_seed():\n"
+                                          "    assert os.environ.get('PYTHONHASHSEED') in (None, '0')\n")
+    assert s._new_test_files() == ["tests/test_new.py"]
+    bad = s._flake_check("i")
+    assert bad is not None and "PYTHONHASHSEED=" in bad["cmd"] and "tests/test_new.py" in bad["cmd"]
+    ev = store.latest_event("flaky_tests")
+    assert ev["payload"]["files"] == ["tests/test_new.py"] and ev["payload"]["seed"] > 0
+
+
+def test_flake_check_passes_stable_tests_and_can_be_disabled(repo):
+    s, store = _plan_with_new_tests(repo, "def test_ok():\n    assert sorted({3, 1, 2}) == [1, 2, 3]\n")
+    assert s._flake_check("i") is None
+    ev = store.latest_event("flake_check")
+    assert ev["payload"]["ok"] and len(ev["payload"]["seeds"]) == 3
+    s.cfg.flake_check_runs = 0
+    assert s._flake_check("i") is None
+
+
+async def test_flaky_new_tests_block_the_integrate_skip(repo):
+    s, store = _plan_with_new_tests(repo, "import os\n\ndef test_seed():\n"
+                                          "    assert os.environ.get('PYTHONHASHSEED') in (None, '0')\n")
+    t = s.graph.tasks["i"]
+    assert s._try_skip_integrate(t) is False                       # full gate green, but new tests are flaky
+    assert "new tests are flaky" in t.last_error

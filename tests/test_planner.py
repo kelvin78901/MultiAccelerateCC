@@ -144,3 +144,19 @@ def test_impossible_unchanged_guard_is_rejected():
     # a guard on a path only a *downstream* task owns is fine at this task's time
     ok["tasks"][0]["done_when"] = ["test -f api/openapi.yaml", "git diff --quiet ${MACC_BASE} -- server"]
     validate_plan(ok)
+
+
+def test_review_spec_must_not_rerun_the_full_suite():
+    from macc.planner import review_reruns_suite as asks
+    gate = ["PYTHONPATH=. .venv/bin/python -m pytest -q tests"]
+    assert asks("Run the full suite and report the result.", gate) == "Run the full suite"
+    assert asks("Then run `PYTHONPATH=. .venv/bin/python   -m pytest -q tests`.", gate) == gate[0]
+    for ok in ("Do not run the full suite; the gate already ran.", "Read the diff; run targeted probes.",
+               "Run the new test file three times."):
+        assert asks(ok, gate) is None, ok
+    plan = yaml.safe_load(MOCK_PLAN)
+    plan["tasks"][-1]["spec"] = "Review the diff. Run the full test suite yourself."
+    with pytest.raises(PlanError, match="spec asks to re-run the full suite"):
+        validate_plan(plan)
+    from macc.planner import PLANNER_PROMPT
+    assert "A review spec never asks to run the full test suite" in PLANNER_PROMPT

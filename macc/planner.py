@@ -56,6 +56,12 @@ Inspect the repository (read-only) as needed before planning.
 
 11. Review verdict vocabulary is fixed: the review task's spec must ask for `VERDICT: APPROVE` or
     `VERDICT: REJECT` (nothing else), and its done_when must not grep for other words.
+    In integrate and review specs, ask for open_questions only for undecided choices a human or the
+    planner must make (they make integrate run); resolved deviations and explanations go to
+    notes_for_downstream.
+    A review spec never asks to run the full test suite: the scheduler runs the integration gate and
+    hands the reviewer its result (with a diff summary, the contracts and the open debts). The review
+    spec asks for reading the diff against the contract and for targeted probes only.
 12. A contract task's done_when must check structure (parse the schema file, import the interface
     module), not grep for keywords you yourself chose.
 13. If the repository already contains some or all of what the description asks for, plan the delta
@@ -208,6 +214,20 @@ def impossible_guards(g: TaskGraph) -> list[str]:
     return out
 
 
+_FULL_SUITE_ASK = re.compile(r"\b(?:run|re-?run|execute)\b[^.\n]{0,40}?\b(?:full|whole|entire|complete)\s+"
+                             r"(?:test\s+)?(?:suite|tests?)\b", re.I)
+
+
+def review_reruns_suite(spec: str, gates: list[str]) -> Optional[str]:
+    """The phrase in a review spec that asks to re-run the full suite (or embeds the gate command)."""
+    for sentence in re.split(r"(?<=[.;!?])\s+|\n\s*\n", spec):
+        m = _FULL_SUITE_ASK.search(sentence)
+        if m and not re.search(r"\b(?:not|never|no need|don'?t|without)\b", sentence, re.I):
+            return m.group(0)
+    flat = " ".join(spec.split())
+    return next((g for g in gates if g and " ".join(g.split()) in flat), None)
+
+
 CONTRACT_MAX_MINUTES = 8
 # a contract that pre-computes answers becomes a long serial node (AutoLeaseRank /insights: 22 min of 28)
 _EXPECTED = re.compile(r"\bexpected\s+(?:outputs?|values?|results?|answers?|numbers?)\b"
@@ -255,6 +275,13 @@ def validate_plan(data: dict) -> TaskGraph:
         if bad:
             raise PlanError(f"contract {t.id}: spec asks for expected values ({bad!r}); the contract's test "
                             "plan says what to test, the test tasks compute expected values")
+    gates = list(((data.get("config") or {}).get("integration_gates")) or [])
+    for t in g.tasks.values():
+        if t.kind == Kind.REVIEW.value:
+            ask = review_reruns_suite(t.spec, gates)
+            if ask:
+                raise PlanError(f"review {t.id}: spec asks to re-run the full suite ({ask!r}); the scheduler runs "
+                                "the gate and gives the reviewer its result. Ask for reading and targeted probes")
     bad_guards = impossible_guards(g)
     if bad_guards:
         raise PlanError("; ".join(bad_guards))

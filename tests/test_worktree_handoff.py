@@ -290,3 +290,12 @@ def test_public_api_delta_and_new_interface_tier():
     tier, reasons, stats = review_risk(f, 0, True, new_public_api=6)
     assert tier == "high" and "6 new public symbols/routes (> 5): new interface" in reasons
     assert stats["new_public_api"] == 6
+
+
+def test_worker_protocol_separates_questions_from_notes(tmp_path):
+    g = TaskGraph([Task("a", "a", owns=["a/**"])])
+    pack = build_context_pack(g.tasks["a"], g, Store(tmp_path / "s.db"))
+    assert "`open_questions` is ONLY for a decision a human or the planner must make" in pack
+    assert "deviation from the task text you already handled" in pack and "never in open_questions" in pack
+    from macc.planner import PLANNER_PROMPT
+    assert "resolved deviations and explanations go to\n    notes_for_downstream" in PLANNER_PROMPT

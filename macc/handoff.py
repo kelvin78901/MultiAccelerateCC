@@ -232,11 +232,16 @@ def review_facts(stats: dict, tier: str, reasons: list[str], contracts: list[str
     return "\n".join(lines)
 
 
-def _full_gate_note(ev: dict, integration_head: Optional[str]) -> str:
+def _full_gate_note(ev: dict, integration_head: Optional[str], integration_tree: Optional[str] = None) -> str:
     """Tell a reviewer what the scheduler already verified, so it does not re-run the whole suite.
-    The claim holds only if the gate ran on the tree being reviewed (same integration HEAD)."""
+    The claim holds only if the gate ran on the tree being reviewed (same tree hash; same HEAD for events
+    recorded before trees were)."""
     p = ev["payload"]
-    if integration_head and p.get("head") and p["head"] != integration_head:
+    if integration_tree and p.get("tree"):
+        moved = p["tree"] != integration_tree
+    else:
+        moved = bool(integration_head and p.get("head") and p["head"] != integration_head)
+    if moved:
         return ("# Latest full integration gate\n"
                 f"- it ran on an older tree ({p['head'][:12]}, result {'PASSED' if p.get('ok') else 'FAILED'}); "
                 f"the integration branch has moved to {integration_head[:12]} since. Run the full suite yourself.")
@@ -254,7 +259,7 @@ def _full_gate_note(ev: dict, integration_head: Optional[str]) -> str:
 
 
 def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "",
-                       integration_head: Optional[str] = None) -> str:
+                       integration_head: Optional[str] = None, integration_tree: Optional[str] = None) -> str:
     """The *only* thing a worker reads besides the repo itself. Short, stable prefix first (cacheable),
     task-specific material last."""
     parts: list[str] = []
@@ -271,10 +276,14 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         "so it enters the debt registry. Mark stub code with the comment `TODO(macc)`.\n"
         "- Grep before you assume. Do not rely on memory of files you have not opened in this session.\n"
         "- Commit nothing yourself; the scheduler commits your worktree.\n"
+        "- `open_questions` is ONLY for a decision a human or the planner must make that you could not make "
+        "yourself (it makes the integrate step run). Anything you resolved, any deviation from the task text "
+        "you already handled, and anything the next task should know is information: put it in "
+        "`notes_for_downstream`, never in open_questions. Do not repeat what an upstream handoff already says.\n"
         "- End your final message with exactly one block:\n"
         f"{HANDOFF_BEGIN}\n"
-        '{"open_questions": "<things a human or planner must decide; empty if none>",\n'
-        ' "notes_for_downstream": "<what the next task must know: paths, names, gotchas>",\n'
+        '{"open_questions": "<an undecided choice for a human/planner; empty if none (usually empty)>",\n'
+        ' "notes_for_downstream": "<what the next task must know: paths, names, gotchas, deviations you resolved>",\n'
         ' "stubs": ["<path>: <what is stubbed and why>"]}\n'
         f"{HANDOFF_END}"
     )
@@ -333,5 +342,5 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
                      "review; see the upstream handoffs for ids). Without it, the direct dependencies are reopened.")
         fg = store.latest_event("full_gate")
         if fg:
-            parts.append(_full_gate_note(fg, integration_head))
+            parts.append(_full_gate_note(fg, integration_head, integration_tree))
     return "\n\n".join(parts) + "\n"

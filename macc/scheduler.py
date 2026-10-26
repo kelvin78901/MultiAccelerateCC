@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Callable, Optional
 
 from .graph import ACTIVE, Kind, State, Task, TaskGraph
 from .handoff import (build_context_pack, generate_handoff, interpreter_conflicts, merge_conflict_spec,
-                      parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
+                      classify_path, parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -46,6 +47,7 @@ class SchedulerConfig:
     review_low_risk_max_lines: int = 400
     review_low_risk_max_new_api: int = 5         # new public defs/classes/routes; features add 17-31, the refactor 4
     plan_base: Optional[str] = None              # integration HEAD when the plan was loaded: "this plan's change"
+    flake_check_runs: int = 3                    # at integrate: run this plan's new test files N times, random seeds
     review_low_model: str = "sonnet"
     review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
@@ -129,12 +131,53 @@ class Scheduler:
             return by_kind[t.kind]
         return self.cost_used / self.runs_done if self.runs_done else 0.0
 
+    def _gate_covers_current_tree(self, ev: Optional[dict]) -> bool:
+        """Did this full_gate event run on the files integration has now? Compared by tree hash (a merge
+        commit with identical content, e.g. after merging into main, still counts); by HEAD for old events."""
+        if not ev:
+            return False
+        p = ev["payload"]
+        if p.get("tree"):
+            return p["tree"] == self.repo.tree(self.repo.integration_path)
+        return p.get("head") == self.repo.head(self.repo.integration_path)
+
+    def _new_test_files(self) -> list[str]:
+        base = self.cfg.plan_base or self.repo.macc_env().get("MACC_BASE")
+        if not base:
+            return []
+        return sorted(f["path"] for f in self.repo.diff_files(base, "HEAD")
+                      if f["status"] == "A" and classify_path(f["path"]) == "test"
+                      and f["path"].endswith(".py") and Path(f["path"]).name.startswith("test_"))
+
+    def _flake_check(self, tid: str) -> Optional[dict]:
+        """Cheap flakiness check at integrate time: run the test files this plan added N times, each with a
+        different random PYTHONHASHSEED (recorded, so a failure reproduces). No model involved. Returns the
+        failing run, or None. Only for pytest gates."""
+        runs = self.cfg.flake_check_runs
+        files = self._new_test_files() if runs > 0 else []
+        if not files:
+            return None
+        gate = next((g for g in self.cfg.integration_gates if "pytest" in g.split()), None)
+        if gate is None:
+            self.emit("flake_check", tid, skipped="integration gate does not run pytest", files=files)
+            return None
+        words = gate.split()
+        runner = " ".join(words[:words.index("pytest") + 1])
+        seeds = [random.randint(1, 2**31 - 1) for _ in range(runs)]
+        for seed in seeds:
+            cmd = f"PYTHONHASHSEED={seed} {runner} -q -p no:cacheprovider {' '.join(files)}"
+            g = self.repo.run_gates([cmd])[0]
+            if not g["ok"]:
+                self.emit("flaky_tests", tid, files=files, seed=seed, cmd=cmd)
+                return g
+        self.emit("flake_check", tid, files=files, seeds=seeds, ok=True)
+        return None
+
     def _ensure_full_gate(self, tid: Optional[str]) -> Optional[dict]:
         """Make sure the full integration gate has passed on the current integration HEAD (reusing a green
         result recorded for that HEAD). Returns the failing gate record, or None when green."""
-        head = self.repo.head(self.repo.integration_path)
         last = self.store.latest_event("full_gate")
-        if last and last["payload"].get("ok") and last["payload"].get("head") == head:
+        if last and last["payload"].get("ok") and self._gate_covers_current_tree(last):
             return None
         gates = self.repo.run_gates(self.cfg.integration_gates)
         self._record_gates(tid, gates, full=True)
@@ -166,12 +209,18 @@ class Scheduler:
             return False
         head = self.repo.head(self.repo.integration_path)
         last = self.store.latest_event("full_gate")
-        reuse = bool(last and last["payload"].get("ok") and last["payload"].get("head") == head)
+        reuse = bool(last and last["payload"].get("ok") and self._gate_covers_current_tree(last))
         if self._ensure_full_gate(t.id):
             return False                      # something to fix: run the integrate worker as planned
         gates = [] if reuse else [{"cmd": c, "ok": True} for c in self.cfg.integration_gates]
         own = self.repo.run_gates(t.done_when) if t.done_when else []
         if not all(g["ok"] for g in own):
+            return False
+        flaky = self._flake_check(t.id)
+        if flaky:                             # the integrate worker runs, told which test is order/seed dependent
+            t.last_error = f"new tests are flaky (passed the gate, failed under another seed): {flaky['cmd']}\n" \
+                           f"{flaky['stdout'][-1500:]}"
+            self._persist(t.id)
             return False
         note = "skipped: gates green, nothing to integrate"
         handoff = {"task_id": t.id, "attempt": t.attempts, "files_changed": [], "api_changes": [],
@@ -240,7 +289,9 @@ class Scheduler:
         t.branch = self.repo.task_branch(t.id)
         wt = self.repo.create_task_worktree(t.id, fresh=True)
         head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
-        pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head)
+        tree = self.repo.tree(self.repo.integration_path) if head else None
+        pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head,
+                                  integration_tree=tree)
         run_as = t
         if t.kind == Kind.REVIEW.value:
             facts, run_as = self._review_setup(t, head)
@@ -266,7 +317,7 @@ class Scheduler:
             diff = self.repo.git("diff", "-U0", base, "HEAD", cwd=self.repo.integration_path).stdout
             new_api = len(public_api_delta(diff)[0])
         last = self.store.latest_event("full_gate")
-        gate_green = (bool(last["payload"].get("ok")) if last and last["payload"].get("head") == head else None)
+        gate_green = bool(last["payload"].get("ok")) if self._gate_covers_current_tree(last) else None
         ancestors = self.graph.ancestors(t.id)
         debts = [d for d in self.store.open_debts() if d["task_id"] in ancestors]
         contracts = sorted({o for a in ancestors if self.graph.tasks[a].kind == Kind.CONTRACT.value
@@ -499,6 +550,14 @@ class Scheduler:
                 self._fail(t, f"integration gate failed after merge: {bad['cmd']}\n{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
                 self._cleanup(tid)
                 return
+            if t.kind == Kind.INTEGRATE.value:
+                flaky = self._flake_check(tid)
+                if flaky:
+                    self.repo.git("reset", "--hard", before, cwd=self.repo.integration_path)
+                    self._fail(t, f"new tests are flaky (failed under another seed): {flaky['cmd']}\n"
+                                  f"{flaky['stdout'][-1500:]}")
+                    self._cleanup(tid)
+                    return
             handoff["merge_commit"] = mr.merge_commit
             self.merged_this_run.append(tid)
             self._merged_since_full_gate = not (full and cmds)
@@ -506,9 +565,9 @@ class Scheduler:
         elif t.kind == Kind.INTEGRATE.value and self.cfg.integration_gates:
             # an integrate that changed nothing still has to prove the tree is green: otherwise the review
             # after it sees no full-gate result for its tree (and cannot be tiered low)
-            bad = self._ensure_full_gate(tid)
+            bad = self._ensure_full_gate(tid) or self._flake_check(tid)
             if bad:
-                self._fail(t, f"integrate changed nothing but the full gate fails: {bad['cmd']}\n"
+                self._fail(t, f"integrate changed nothing but a gate fails: {bad['cmd']}\n"
                               f"{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
                 self._cleanup(tid)
                 return
@@ -555,7 +614,8 @@ class Scheduler:
         if full and gates:
             bad = next((g for g in gates if not g["ok"]), None)
             self.emit("full_gate", tid, ok=bad is None, seconds=secs, cmds=[g["cmd"] for g in gates],
-                      failed_cmd=bad["cmd"] if bad else None, head=self.repo.head(self.repo.integration_path))
+                      failed_cmd=bad["cmd"] if bad else None, head=self.repo.head(self.repo.integration_path),
+                      tree=self.repo.tree(self.repo.integration_path))
 
     def _final_gate(self) -> str:
         """per_task policy: one full integration gate at the end if anything merged since the last one.
@@ -673,7 +733,7 @@ class Scheduler:
             else:
                 gates = self.repo.run_gates(t.done_when)
                 if all(g["ok"] for g in gates) and t.kind == Kind.INTEGRATE.value and self.cfg.integration_gates:
-                    bad = self._ensure_full_gate(t.id)   # the review after it is tiered on this fact
+                    bad = self._ensure_full_gate(t.id) or self._flake_check(t.id)   # the review is tiered on this
                     if bad:
                         gates.append(bad)
                 if all(g["ok"] for g in gates):

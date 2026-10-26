@@ -64,12 +64,26 @@ class ClaudeWorker:
         cmd += self.extra_args
         return cmd
 
+    _no_effort_flag = False
+
     async def __call__(self, task: Task, wt_path: Path, context_pack: str) -> WorkerResult:
+        res = await self._invoke(task, wt_path, context_pack)
+        # older CLIs reject --effort; drop it once and retry
+        if not res.ok and res.error and "unknown option" in res.error.lower() and "--effort" in res.error:
+            ClaudeWorker._no_effort_flag = True
+            res = await self._invoke(task, wt_path, context_pack)
+        return res
+
+    async def _invoke(self, task: Task, wt_path: Path, context_pack: str) -> WorkerResult:
         t0 = time.time()
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow nested invocation from inside a Claude session
+        cmd = self._cmd(task)
+        if ClaudeWorker._no_effort_flag and "--effort" in cmd:
+            i = cmd.index("--effort")
+            del cmd[i:i + 2]
         proc = await asyncio.create_subprocess_exec(
-            *self._cmd(task), cwd=str(wt_path), env=env,
+            *cmd, cwd=str(wt_path), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:

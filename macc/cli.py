@@ -58,6 +58,26 @@ def cmd_init(a) -> int:
 
 def cmd_plan(a) -> int:
     repo, store = _open(a.repo)
+    if a.from_desc:
+        from .planner import generate_plan
+        out = Path(a.plan or "plan.yaml")
+        if a.worker == "mock":
+            worker = MockWorker()
+        else:
+            worker = ClaudeWorker(default_model=a.model, timeout=a.timeout)
+            if not worker.available():
+                print("claude binary not found on PATH", file=sys.stderr)
+                return 2
+        g = asyncio.run(generate_plan(a.from_desc, repo.root, worker, out, effort=a.effort, model=a.model))
+        print(f"wrote {out} ({len(g.tasks)} tasks). Review it, then: macc plan {out}")
+        for tid in g.topo_order():
+            t = g.tasks[tid]
+            print(f"  {t.kind:<9} {t.id:<24} deps={t.deps} owns={t.owns} ~{t.est_minutes:.0f}min")
+        print("\n" + g.to_mermaid())
+        return 0
+    if not a.plan:
+        print("usage: macc plan PLAN.yaml | macc plan --from 'description' [PLAN.yaml]", file=sys.stderr)
+        return 2
     g, cfg = load_plan(a.plan)
     existing = store.load_graph()
     # keep runtime state for tasks that already exist and whose spec did not change
@@ -201,7 +221,12 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init").set_defaults(fn=cmd_init)
-    sp = sub.add_parser("plan"); sp.add_argument("plan"); sp.set_defaults(fn=cmd_plan)
+    sp = sub.add_parser("plan"); sp.add_argument("plan", nargs="?", default=None)
+    sp.add_argument("--from", dest="from_desc", default=None, help="feature description -> generate PLAN.yaml with one planner call")
+    sp.add_argument("--worker", choices=["claude", "mock"], default="claude")
+    sp.add_argument("--model", default=None); sp.add_argument("--effort", default="high")
+    sp.add_argument("--timeout", type=int, default=900)
+    sp.set_defaults(fn=cmd_plan)
     sp = sub.add_parser("run")
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")
     sp.add_argument("--model", default=None)

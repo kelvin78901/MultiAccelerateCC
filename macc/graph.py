@@ -38,6 +38,7 @@ class Kind(str, Enum):
     REVIEW = "review"          # independent review of a diff
     INTEGRATE = "integrate"    # merge + run full gates
     MERGE = "merge"            # resolve conflict markers (synthetic, spawned by the scheduler)
+    PLAN = "plan"              # planner call (synthetic, read-only)
     MANUAL = "manual"          # a human does it
 
 

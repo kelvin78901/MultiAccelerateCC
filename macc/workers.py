@@ -62,8 +62,8 @@ class ClaudeWorker:
             cmd += ["--effort", task.effort]
         if self.settings_file:
             cmd += ["--settings", str(self.settings_file)]
-        if task.kind == "review":
-            cmd += ["--allowedTools", "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"]
+        if task.kind in ("review", "plan"):
+            cmd += ["--allowedTools", "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(find:*)"]
         cmd += self.extra_args
         return cmd
 
@@ -156,6 +156,12 @@ class MockWorker:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return WorkerResult(ok=False, error="preempted", preempted=True, seconds=time.time() - t0)
+        if task.kind == "plan":
+            bad = "mock:bad_plan_first" in context_pack and "previous plan was rejected" not in context_pack
+            yaml_text = MOCK_PLAN_BAD if bad else MOCK_PLAN
+            text = f"here is the plan\n<<<MACC_PLAN\n{yaml_text}\nMACC_PLAN>>>"
+            return WorkerResult(ok=True, output_text=text, model="mock", input_tokens=self.tokens,
+                                output_tokens=self.tokens // 4, seconds=time.time() - t0)
         if task.kind == "merge":
             if "mock:merge_fail" in task.spec:
                 return WorkerResult(ok=False, error="mock cannot resolve", seconds=time.time() - t0)
@@ -192,3 +198,64 @@ class MockWorker:
         return WorkerResult(ok=True, output_text=text, fields=parse_worker_output(text), model="mock",
                             input_tokens=self.tokens, output_tokens=self.tokens // 4,
                             seconds=time.time() - t0)
+
+
+MOCK_PLAN = """config:
+  max_parallel: 3
+  token_budget: 300000
+  integration_gates: ["true"]
+defaults:
+  effort: medium
+  max_attempts: 2
+tasks:
+  - id: contract
+    title: API contract
+    kind: contract
+    owns: ["api/**"]
+    effort: high
+    est_minutes: 10
+    est_tokens: 40000
+    done_when: ["test -f api/openapi.yaml"]
+    spec: |
+      Write api/openapi.yaml.
+  - id: backend
+    title: Backend
+    deps: [contract]
+    owns: ["server/**"]
+    est_minutes: 30
+    est_tokens: 90000
+    done_when: ["true"]
+    spec: |
+      Implement the server.
+  - id: frontend
+    title: Frontend
+    deps: [contract]
+    owns: ["web/**"]
+    est_minutes: 30
+    est_tokens: 90000
+    done_when: ["true"]
+    spec: |
+      Implement the UI.
+  - id: integrate
+    title: Integrate
+    kind: integrate
+    deps: [backend, frontend]
+    effort: high
+    est_minutes: 15
+    est_tokens: 60000
+    done_when: ["true"]
+    spec: |
+      Wire everything, resolve debts.
+  - id: review
+    title: Review
+    kind: review
+    deps: [integrate]
+    effort: high
+    est_minutes: 10
+    est_tokens: 50000
+    spec: |
+      Review the integration diff. APPROVE or REJECT.
+"""
+
+# invalid on purpose: backend and frontend both own server/** and could run concurrently
+MOCK_PLAN_BAD = MOCK_PLAN.replace('owns: ["web/**"]', 'owns: ["server/**"]')

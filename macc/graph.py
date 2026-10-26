@@ -263,17 +263,23 @@ class TaskGraph:
         t.preempt = False
         if prev is not None and prev != output_hash:
             changed = self.propagate_stale(tid)
+        else:
+            # first completion (or identical output): downstream hashes now include this output
+            for d in self.descendants(tid):
+                self.tasks[d].input_hash = self.compute_input_hash(d)
         return changed
 
-    def propagate_stale(self, tid: str) -> list[str]:
+    def propagate_stale(self, tid: str, force: bool = False) -> list[str]:
         """Upstream input changed. Build-system rule:
         DONE -> STALE (revalidate), RUNNING/REVIEW -> preempt flag, PENDING/READY unchanged,
-        FAILED -> PENDING (worth retrying with new inputs)."""
+        FAILED -> PENDING (worth retrying with new inputs).
+        `force` skips the hash comparison: used when an upstream *spec* changed, i.e. its output
+        will change but has not yet (no point letting downstream keep running on doomed inputs)."""
         changed: list[str] = []
         for d in self.descendants(tid):
             u = self.tasks[d]
             new_hash = self.compute_input_hash(d)
-            if new_hash == u.input_hash:
+            if new_hash == u.input_hash and not force:
                 continue
             u.input_hash = new_hash
             if u.state == State.DONE.value:
@@ -301,8 +307,8 @@ class TaskGraph:
         else:
             t.state = State.PENDING.value
             t.attempts = 0
-        # its output will change, so everything below is stale too
-        affected = [tid] + self.propagate_stale(tid)
+        # its output will change, so everything below is stale too (forced: hashes still match for now)
+        affected = [tid] + self.propagate_stale(tid, force=True)
         return affected
 
     def add_subtasks(self, parent_id: str, subtasks: list[Task]) -> None:

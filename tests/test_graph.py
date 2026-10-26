@@ -129,3 +129,15 @@ def test_roundtrip_dict():
     g2 = TaskGraph(Task.from_dict(d) for d in dicts)
     assert g2.topo_order() == g.topo_order()
     assert "graph TD" in g2.to_mermaid()
+
+
+def test_first_done_refreshes_downstream_hashes():
+    g = web_graph()
+    h0 = g.tasks["backend"].input_hash
+    g.mark_done("contract", "h1")
+    assert g.tasks["backend"].input_hash != h0
+    # a no-op refresh must not flip anything to stale afterwards
+    g.mark_done("backend", "b1")
+    before = {k: t.state for k, t in g.tasks.items()}
+    g.refresh_hashes()
+    assert {k: t.state for k, t in g.tasks.items()} == before

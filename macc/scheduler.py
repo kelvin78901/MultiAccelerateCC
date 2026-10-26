@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .graph import Kind, State, Task, TaskGraph
-from .handoff import build_context_pack, generate_handoff, merge_conflict_spec, parse_verdict
+from .handoff import build_context_pack, generate_handoff, merge_conflict_spec, parse_reopen, parse_verdict
 from .store import Store
 from .workers import WorkerFn, WorkerResult
 from .worktree import Repo
@@ -36,6 +36,7 @@ class SchedulerConfig:
     revalidate_stale: bool = True
     merge_agent: bool = True                     # spawn a merge worker on textual conflicts
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
+    cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
 
 
 EventFn = Callable[[str, Optional[str], dict], None]
@@ -53,7 +54,8 @@ class Scheduler:
         self.running: dict[str, asyncio.Task] = {}
         self.parked: dict[str, dict] = {}        # finished workers waiting for merge_after targets
         self.tokens_used = 0
-        self.cost_used = 0.0
+        # budget is cumulative over runs of the same plan: start from what was already spent since plan load
+        self.cost_used = max(0.0, store.usage_totals()["cost_usd"] - self.cfg.cost_baseline_usd)
         self.runs_done = 0
         if hasattr(worker, "gate_commands"):
             worker.gate_commands = list(self.cfg.integration_gates)
@@ -353,8 +355,10 @@ class Scheduler:
     def _review_reject(self, review: Task, notes: str) -> None:
         """REJECT verdict: reopen the reviewed tasks with the notes as their error context.
         Each rejection consumes one attempt of the review task, so review/fix loops are bounded."""
-        reviewed = [d for d in review.deps
-                    if self.graph.tasks[d].kind in (Kind.CODE.value, Kind.CONTRACT.value, Kind.INTEGRATE.value)]
+        redo_kinds = (Kind.CODE.value, Kind.CONTRACT.value, Kind.INTEGRATE.value)
+        named = [x for x in parse_reopen(notes) if x in self.graph.ancestors(review.id)
+                 and self.graph.tasks[x].kind in redo_kinds]
+        reviewed = named or [d for d in review.deps if self.graph.tasks[d].kind in redo_kinds]
         if review.attempts >= review.max_attempts:
             # last round: stop the fix loop, leave reviewed work merged, escalate to a human
             self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts, final=True)

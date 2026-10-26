@@ -43,6 +43,14 @@ def parse_verdict(notes: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
+def parse_reopen(notes: str) -> list[str]:
+    """Optional `REOPEN: task_a, task_b` line in a REJECT verdict names the tasks to redo."""
+    m = re.search(r"(?im)^[ \t]*(?:\*\*)?reopen[ \t]*[:：][ \t]*(?:\*\*)?[ \t]*([A-Za-z0-9_., \t-]+?)[ \t]*$", notes or "")
+    if not m:
+        return []
+    return [x.strip() for x in re.split(r"[,\s]+", m.group(1)) if x.strip()]
+
+
 def parse_worker_output(text: str) -> dict:
     """Extract the JSON block the worker emits between markers. Tolerant of missing/invalid blocks."""
     m = re.search(re.escape(HANDOFF_BEGIN) + r"(.*?)" + re.escape(HANDOFF_END), text, re.S)
@@ -184,5 +192,7 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
     if task.kind == "review":
         parts.append("# Review output\nDo not edit code. Read the diff and tests. Report: root-cause fixes vs "
                      "symptom fixes, missing tests, ownership violations, hidden stubs. notes_for_downstream MUST start "
-                     "with a line `VERDICT: APPROVE` or `VERDICT: REJECT`, followed by reasons.")
+                     "with a line `VERDICT: APPROVE` or `VERDICT: REJECT`, followed by reasons. On REJECT add a line "
+                     "`REOPEN: <task ids>` naming the tasks whose work must be redone (any ancestor task of this "
+                     "review; see the upstream handoffs for ids). Without it, the direct dependencies are reopened.")
     return "\n\n".join(parts) + "\n"

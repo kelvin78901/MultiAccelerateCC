@@ -99,8 +99,8 @@ def cmd_plan(a) -> int:
     g.validate()
     g.refresh_hashes()
     store.save_graph(g)
-    if cfg:
-        (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    cfg["cost_baseline_usd"] = store.usage_totals()["cost_usd"]   # budget counts from here
+    (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
     return 0
 

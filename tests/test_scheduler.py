@@ -379,3 +379,43 @@ def test_merge_after_validation():
     g2 = TaskGraph([Task("a", "a"), Task("b", "b", deps=["a"], merge_after=["a"])])
     with _pt.raises(GraphError, match="redundant"):
         g2.validate()
+
+
+async def test_review_reopen_names_specific_tasks(repo):
+    tasks = [
+        Task("a", "a", owns=["a/**"]),
+        Task("b", "b", owns=["b/**"]),
+        Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["a", "b"], owns=["a/**", "b/**"]),
+        Task("review", "r", kind=Kind.REVIEW.value, deps=["integrate"], owns=["docs/**"], max_attempts=2),
+    ]
+    worker = MockWorker()
+    orig = worker.__call__
+    rounds = {"n": 0}
+
+    async def w(task, wt, pack):
+        r = await orig(task, wt, pack)
+        if task.kind == "review":
+            rounds["n"] += 1
+            r.fields["notes_for_downstream"] = ("VERDICT: REJECT\nREOPEN: b\nb lacks tests" if rounds["n"] == 1
+                                                else "VERDICT: APPROVE")
+        return r
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    events = []
+    s = Scheduler(repo, store, g, w, on_event=lambda t, tid, p: events.append((t, tid, p)))
+    summary = await s.run()
+    assert summary["finished"], summary
+    rej = next(p for t, tid, p in events if t == "review_rejected")
+    assert rej["reviewed"] == ["b"]
+    assert worker.calls.count("b") >= 2 and worker.calls.count("a") == 1
+
+
+async def test_cost_budget_is_cumulative_across_runs(repo):
+    store = Store(repo.macc_dir / "state.db")
+    store.add_usage("old", 1, "x", True, cost_usd=5.0)       # spent before this plan
+    g = TaskGraph([Task("t", "t", owns=["a/**"])]); g.validate()
+    cfg = SchedulerConfig(cost_budget_usd=1.0, cost_baseline_usd=5.0)
+    s = Scheduler(repo, store, g, MockWorker(), cfg)
+    assert s.cost_used == 0.0
+    summary = await s.run()
+    assert summary["finished"]

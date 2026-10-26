@@ -160,4 +160,24 @@ def test_plan_load_prints_prediction(repo_dir, tmp_path, capsys):
     assert main(["--repo", str(repo_dir), "plan", str(plan)]) == 0
     out = capsys.readouterr().out
     assert "prediction: wall 120 s, cost $0.00, serial share 100% (serial points: t)" in out
-    assert "split hint" not in out                                     # off until the backtest earns it
+    # hints are on, but with no history a hint gives no direction
+    assert "split hint: t: serial point, insufficient data for a split direction [level 7: plan estimate" in out
+
+
+def test_init_history_and_gate_baseline_survive_plan_load(repo_dir, tmp_path, capsys):
+    import json
+    other = tmp_path / "other.db"
+    other.write_text("")
+    r = str(repo_dir)
+    assert main(["--repo", r, "init", "--gate", "true", "--history", str(other)]) == 0
+    assert main(["--repo", r, "init", "--history", str(other)]) == 0                 # appending twice: no dup
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["history_dbs"] == [str(other.resolve())] and cfg["gate_baseline_s"] >= 0
+    plan = tmp_path / "p.yaml"
+    plan.write_text("config:\n  max_parallel: 2\ntasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n")
+    assert main(["--repo", r, "plan", str(plan)]) == 0
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["history_dbs"] == [str(other.resolve())] and "gate_baseline_s" in cfg
+    assert cfg["integration_gates"] == ["true"] and cfg["max_parallel"] == 2
+    assert main(["--repo", r, "backtest"]) == 0
+    assert "history: this repo + 1 other db(s)" in capsys.readouterr().out

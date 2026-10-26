@@ -46,6 +46,10 @@ def _print_event(type_: str, tid, payload: dict) -> None:
     print(f"[{ts}] {type_:<24} {tid or '-':<20}{extra}", flush=True)
 
 
+# config keys that belong to the repository, not to a plan
+REPO_KEYS = ("history_dbs", "gate_baseline_s", "gate_timeout", "worktree_setup", "integration_gates")
+
+
 def cmd_init(a) -> int:
     repo, store = _open(a.repo)
     repo.ensure_integration()
@@ -56,12 +60,21 @@ def cmd_init(a) -> int:
     cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
     if a.gate:
         cfg["integration_gates"] = a.gate
-        res = repo.run_gates(a.gate)
+        res = repo.run_gates(a.gate, timeout=int(cfg.get("gate_timeout", 1800)))
         bad = [r for r in res if not r["ok"]]
         if bad:
             print(f"WARNING: gate fails on the current integration tree: {bad[0]['cmd']!r}\n{bad[0]['stderr'][-600:]}{bad[0]['stdout'][-600:]}")
         else:
-            print(f"gate verified on integration tree: {a.gate}")
+            # this repo's own gate time: the cost model uses it (worker times may come from other repos)
+            cfg["gate_baseline_s"] = round(sum(r.get("seconds", 0.0) for r in res), 2)
+            print(f"gate verified on integration tree: {a.gate} ({cfg['gate_baseline_s']} s)")
+    for h in a.history or []:
+        path = str(Path(h).expanduser().resolve())
+        if not Path(path).is_file():
+            print(f"WARNING: history db not found: {path}")
+        dbs = cfg.setdefault("history_dbs", [])
+        if path not in dbs:
+            dbs.append(path)
     cfgp.write_text(json.dumps(cfg, indent=2))
     print(f"initialised {repo.macc_dir} (integration branch + state db); gates={cfg.get('integration_gates', [])}")
     return 0
@@ -74,11 +87,12 @@ def _prediction_lines(g, store: Store, cfg: dict) -> list[str]:
         reconstruct_serial_flags(store)
         backfill_fix_rounds(store)
         pred = predict(g, store, max_parallel=int(cfg.get("max_parallel", 4)),
-                       review_tiering=cfg.get("review_tiering", True), low_model=cfg.get("review_low_model", "sonnet"))
+                       review_tiering=cfg.get("review_tiering", True), low_model=cfg.get("review_low_model", "sonnet"),
+                       history_dbs=cfg.get("history_dbs", []), gate_baseline_s=cfg.get("gate_baseline_s"))
     except Exception as e:                      # never block planning on the model
         return [f"prediction unavailable: {e!r}"[:200]]
     lines = [describe(pred)]
-    if cfg.get("split_hints"):
+    if cfg.get("split_hints", True):
         floor = store._conn.execute("SELECT MIN(seconds) m FROM usage WHERE kind='code' AND model IS NOT NULL "
                                     "AND ok=1").fetchone()["m"] or 30.0
         lines += [f"split hint: {h}" for h in split_hints(pred, floor)]
@@ -165,6 +179,11 @@ def cmd_plan(a) -> int:
     g.validate()
     g.refresh_hashes()
     store.save_graph(g)
+    # repo-level settings written by `macc init` survive loading a plan (unless the plan sets them)
+    prev = json.loads((repo.macc_dir / "config.json").read_text()) if (repo.macc_dir / "config.json").exists() else {}
+    for k in REPO_KEYS:
+        if k in prev and k not in cfg:
+            cfg[k] = prev[k]
     cfg["cost_baseline_usd"] = store.usage_totals()["cost_usd"]   # budget counts from here
     cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -255,6 +274,34 @@ def cmd_status(a) -> int:
     return 0
 
 
+def cmd_backtest(a) -> int:
+    from .costmodel import backtest
+    repo, store = _open(a.repo)
+    cfgp = repo.macc_dir / "config.json"
+    cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
+    res = backtest(store, cfg.get("history_dbs", []))
+    if a.json:
+        print(json.dumps(res, indent=2))
+        return 0
+    pct = lambda x: "n/a" if x is None else f"{x:+.0%}"   # noqa: E731
+    print("| run | tasks | wall pred / actual | cost pred / actual | serial share pred / actual |")
+    print("|---|---|---|---|---|")
+    for r in res["runs"]:
+        p_, a_, e = r["pred"], r["actual"], r["error"]
+        print(f"| {r['run_seq']} | {r['tasks']} | {p_['wall_s']:.0f} / {a_['wall_s']:.0f} s ({pct(e['wall'])}) | "
+              f"${p_['cost_usd']:.2f} / ${a_['cost_usd']:.2f} ({pct(e['cost'])}) | "
+              f"{p_['serial_share']:.0%} / {a_['serial_share']:.0%} ({e['serial_share'] * 100:+.0f} pt) |")
+    for x in res["excluded"]:
+        print(f"excluded run {x['run_seq']}: {x['reason']}")
+    m = res["mean_abs_error"]
+    print(f"\n{res['within_30pct']}/{len(res['runs'])} runs within 30% (wall and cost); mean |error|: "
+          f"wall {pct(m['wall'])[1:] if m['wall'] is not None else 'n/a'}, cost "
+          f"{pct(m['cost'])[1:] if m['cost'] is not None else 'n/a'}, serial share "
+          f"{m['serial_share'] * 100:.0f} pt" if m["serial_share"] is not None else "")
+    print(f"history: this repo + {len(cfg.get('history_dbs', []))} other db(s)")
+    return 0
+
+
 def cmd_change(a) -> int:
     repo, store = _open(a.repo)
     g = store.load_graph()
@@ -334,6 +381,8 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("init"); sp.add_argument("--gate", action="append", default=None,
                                                  help="integration gate command (repeatable); recorded in config.json and seen by the planner")
+    sp.add_argument("--history", action="append", default=None,
+                    help="another macc state.db whose worker history calibrates the cost model (repeatable, appends)")
     sp.set_defaults(fn=cmd_init)
     sp = sub.add_parser("plan"); sp.add_argument("plan", nargs="?", default=None)
     sp.add_argument("--from", dest="from_desc", default=None, help="feature description -> generate PLAN.yaml with one planner call")
@@ -356,6 +405,8 @@ def main(argv=None) -> int:
     sp.add_argument("--no-guard", action="store_true", help="do not inject the ownership PreToolUse hook")
     sp.set_defaults(fn=cmd_run)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    sp = sub.add_parser("backtest", help="predict every past run leave-one-out and compare with what happened")
+    sp.add_argument("--json", action="store_true"); sp.set_defaults(fn=cmd_backtest)
     sp = sub.add_parser("change"); sp.add_argument("task"); sp.add_argument("--spec", default=None)
     sp.add_argument("--owns", action="append", default=None, help="replace ownership globs (repeatable)")
     sp.add_argument("--done-when", action="append", default=None, help="replace gate commands (repeatable)")

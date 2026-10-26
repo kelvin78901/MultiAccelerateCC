@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS usage (
     serial INTEGER,             -- 1 if the task was a global serial point when dispatched
     pred_seconds REAL,          -- cost model's prediction for this run (compare with seconds)
     pred_cost REAL,
-    fix_round INTEGER           -- 1 if the task had completed before (re-run after a change or a REJECT)
+    fix_round INTEGER,          -- 1 if the task had completed before (re-run after a change or a REJECT)
+    run_seq INTEGER             -- seq of the run_started event of the run this worker belonged to
 );
 """
 
@@ -106,7 +107,7 @@ class Store:
         if "kind" not in cols:          # before v0.2.9
             self._conn.execute("ALTER TABLE usage ADD COLUMN kind TEXT")
         for col, typ in (("serial", "INTEGER"), ("pred_seconds", "REAL"), ("pred_cost", "REAL"),
-                         ("fix_round", "INTEGER")):
+                         ("fix_round", "INTEGER"), ("run_seq", "INTEGER")):
             if col not in cols:         # before v0.3.5
                 self._conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {typ}")
         # backfill older rows from tasks that still exist (estimates do not change after planning)
@@ -260,17 +261,17 @@ class Store:
                   cost_usd: float = 0.0, seconds: float = 0.0, est_minutes: Optional[float] = None,
                   kind: Optional[str] = None, serial: Optional[bool] = None,
                   pred_seconds: Optional[float] = None, pred_cost: Optional[float] = None,
-                  fix_round: Optional[bool] = None) -> None:
+                  fix_round: Optional[bool] = None, run_seq: Optional[int] = None) -> None:
         if kind is None:
             r = self._conn.execute("SELECT kind FROM tasks WHERE id=?", (task_id,)).fetchone()
             kind = r["kind"] if r else ("plan" if task_id == "_plan" else None)
         self._conn.execute(
             "INSERT INTO usage(task_id,attempt,worker,model,input_tokens,output_tokens,cache_read_tokens,"
-            "cost_usd,seconds,ok,est_minutes,kind,serial,pred_seconds,pred_cost,fix_round) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "cost_usd,seconds,ok,est_minutes,kind,serial,pred_seconds,pred_cost,fix_round,run_seq) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, attempt, worker, model, input_tokens, output_tokens, cache_read_tokens,
              cost_usd, seconds, int(ok), est_minutes, kind, None if serial is None else int(serial),
-             pred_seconds, pred_cost, None if fix_round is None else int(fix_round)),
+             pred_seconds, pred_cost, None if fix_round is None else int(fix_round), run_seq),
         )
 
     def usage_totals(self) -> dict:

@@ -249,6 +249,30 @@ is almost all insights (−72%, the 1350 s contract that v0.2.12 now rejects); w
 runs average 18%. Hints stay off until that is decided; low-tier (sonnet) review samples are still
 missing everywhere (routes C, +91% wall).
 
+**v0.3.7: the model in production.** `history_dbs` (config; `macc init --history <db>` appends) pools other
+repositories' worker rows; the gate term uses only this repository (its recorded full gates, else
+`gate_baseline_s` measured by `macc init --gate`). `macc backtest` is built in: leave-one-out over every
+finished run, runs with a serial bottleneck excluded as a fixed rule (a `serial_bottleneck` event or,
+before that event existed, a serial worker > 3x its estimate). Split hints are on; each names the history
+level and sample count behind it, and at level 5 or coarser (kind only) it says "insufficient data".
+`macc plan` now keeps repository settings (`history_dbs`, gate baseline, gate timeout, worktree setup).
+
+AutoLeaseRank, `history_dbs` = macc-smoke, `macc backtest`:
+
+| run | wall pred / actual | cost pred / actual | serial share |
+|---|---|---|---|
+| watch r1 | 458 / 585 s (−22%) | $3.84 / $4.05 (−5%) | 85% / 72% |
+| watch r2 | 186 / 144 s (+29%) | $0.87 / $1.05 (−18%) | 76% / 75% |
+| insights | excluded (serial bottleneck: 1350 s contract) | | |
+| refactor | 436 / 425 s (+2%) | $3.19 / $3.51 (−9%) | 92% / 88% |
+| routes A (failed run) | 179 / 265 s (−32%) | $1.27 / $1.61 (−21%) | 81% / 75% |
+| routes B | 314 / 251 s (+25%) | $2.08 / $1.86 (+12%) | 99% / 97% |
+| routes C (sonnet review) | 188 / 99 s (+91%) | $0.80 / $0.35 (+133%) | 99% / 88% |
+
+The four original runs: all three that count are within 30%. Over all six: 4/6, mean error wall 34%, cost
+33%, serial share 6 points. The two misses are a run that burnt two failed attempts (routes A) and the only
+low-tier review, which has no sonnet-review history to draw on yet (routes C).
+
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus
 the review, and integrate was revalidated by its gates; wall time there was 75% review. Nothing in the

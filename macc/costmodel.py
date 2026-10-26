@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import statistics
+from pathlib import Path
 from typing import Iterable, Optional
 
 from .graph import Kind, State, TaskGraph
@@ -63,6 +64,7 @@ def reconstruct_serial_flags(store: Store) -> int:
     events = [dict(r) for r in conn.execute("SELECT seq, type, task_id, payload FROM events ORDER BY seq")]
     flags: dict[tuple[str, int], list[int]] = {}
     fixes: dict[tuple[str, int], list[int]] = {}   # same keys: had the task completed before this dispatch?
+    runs_of: dict[tuple[str, int], list[int]] = {}  # same keys: seq of the run_started the dispatch belongs to
     completed: set[str] = set()                     # across runs
     run: list = []
     for ev in events + [{"seq": None, "type": "run_started", "task_id": None, "payload": None}]:
@@ -75,6 +77,7 @@ def reconstruct_serial_flags(store: Store) -> int:
                 if e["type"] == "dispatched" and tid:
                     attempt = json.loads(e["payload"] or "{}").get("attempt", 1)
                     fixes.setdefault((tid, attempt), []).append(int(tid in completed))
+                    runs_of.setdefault((tid, attempt), []).append(run[0]["seq"] if run[0]["type"] == "run_started" else None)
                     if tid in graph.tasks:
                         later = graph.descendants(tid)
                         flags.setdefault((tid, attempt), []).append(int(touched - finished - {tid} <= later))
@@ -86,13 +89,20 @@ def reconstruct_serial_flags(store: Store) -> int:
             run.append(ev)
     updated = 0
     seen: dict[tuple[str, int], int] = {}
-    rows = conn.execute("SELECT id, task_id, attempt FROM usage WHERE worker NOT LIKE '%:merge' "
-                        "ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id, task_id, attempt, worker FROM usage ORDER BY id").fetchall()
+    last_run = None
     for r in rows:
+        if r["worker"].endswith(":merge"):      # a merge agent runs inside its task's run
+            if last_run is not None:
+                conn.execute("UPDATE usage SET run_seq=? WHERE id=? AND run_seq IS NULL", (last_run, r["id"]))
+            continue
         key = (r["task_id"], r["attempt"])
         i = seen.get(key, 0)
         seen[key] = i + 1
-        vals, fx = flags.get(key, []), fixes.get(key, [])
+        vals, fx, rs = flags.get(key, []), fixes.get(key, []), runs_of.get(key, [])
+        if i < len(rs) and rs[i] is not None:
+            last_run = rs[i]
+            conn.execute("UPDATE usage SET run_seq=? WHERE id=? AND run_seq IS NULL", (rs[i], r["id"]))
         if i < len(vals):
             updated += conn.execute("UPDATE usage SET serial=? WHERE id=? AND serial IS NULL",
                                     (vals[i], r["id"])).rowcount
@@ -125,9 +135,22 @@ def backfill_fix_rounds(store: Store) -> int:
     return updated
 
 
-def history(store: Store, exclude_ids: Iterable[int] = ()) -> list[dict]:
-    """Every worker run that can calibrate the model: kind, model family, fix round, serial, seconds, cost."""
-    excl = set(exclude_ids)
+def history(store: Store, exclude_ids: Iterable[int] = (), extra_dbs: Iterable[str] = ()) -> list[dict]:
+    """Every worker run that can calibrate the model: kind, model family, fix round, serial, seconds, cost.
+    `extra_dbs` are other repositories' state.db files (config `history_dbs`): worker times transfer across
+    repositories, gate times do not (those come from this repository only)."""
+    out = _history_rows(store, set(exclude_ids))
+    for path in extra_dbs:
+        if Path(path).is_file():
+            other = Store(path)
+            try:
+                out += _history_rows(other, set())
+            finally:
+                other.close()
+    return out
+
+
+def _history_rows(store: Store, excl: set) -> list[dict]:
     out = []
     for r in store._conn.execute("SELECT id, kind, model, seconds, cost_usd, serial, fix_round FROM usage "
                                  "WHERE model IS NOT NULL AND kind IS NOT NULL AND kind != 'plan' "
@@ -146,17 +169,22 @@ def full_gate_seconds(store: Store, exclude_seq: Iterable[int] = ()) -> Optional
     return statistics.median(xs) if xs else None
 
 
-def _pick(rows: list[dict], levels: list[tuple[str, dict]], field: str) -> Optional[tuple[float, str]]:
-    """Median of `field` over the first level (name, filter) with at least MIN_SAMPLES rows."""
-    for name, flt in levels:
+# Lookup levels, finest first. 1-4 use the task's own kind and at least one more dimension; 5 is the kind
+# alone, 6 every kind, 7 the plan's estimate. A split hint resting on level >= COARSE_LEVEL has no direction.
+COARSE_LEVEL = 5
+
+
+def _pick(rows: list[dict], levels: list[tuple[str, dict]], field: str) -> Optional[tuple[float, str, int, int]]:
+    """(median, name, level number, n) of `field` for the first level with at least MIN_SAMPLES rows."""
+    for i, (name, flt) in enumerate(levels, 1):
         xs = [r[field] for r in rows if all(r[k] == v for k, v in flt.items())]
         if len(xs) >= MIN_SAMPLES:
-            return statistics.median(xs), f"{name} (n={len(xs)})"
+            return statistics.median(xs), name, i, len(xs)
     return None
 
 
 def _estimate(kind: str, family: Optional[str], fix: bool, serial: bool, rows: list[dict],
-              est_minutes: float) -> tuple[float, float, str]:
+              est_minutes: float) -> tuple[float, float, str, int, int]:
     rnd = "fix round" if fix else "first round"
     ser = {"serial": True} if serial else {}
     sname = " as serial point" if serial else ""
@@ -165,17 +193,19 @@ def _estimate(kind: str, family: Optional[str], fix: bool, serial: bool, rows: l
               (f"{kind}/{rnd}{sname}", {"kind": kind, "fix": fix, **ser}),
               (f"{kind}{sname}", {"kind": kind, **ser}), (kind, {"kind": kind}), ("all kinds", {})]
     got = _pick(rows, levels, "seconds")
-    secs, src = got if got else (est_minutes * 60, "plan estimate (no history)")
-    cost_levels = [(n, {k: v for k, v in f.items() if k != "serial"}) for n, f in levels]
+    secs, name, level, n = got if got else (est_minutes * 60, "plan estimate (no history)", len(levels) + 1, 0)
+    cost_levels = [(nm, {k: v for k, v in f.items() if k != "serial"}) for nm, f in levels]
     c = _pick(rows, cost_levels, "cost")
-    return secs, (c[0] if c else 0.0), src
+    src = f"{name} (n={n})" if n else name
+    return secs, (c[0] if c else 0.0), src, level, n
 
 
 # ---------------------------------------------------------------------------- predict
 def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_parallel: int = 4,
             exclude_usage: Iterable[int] = (), exclude_gate_seq: Iterable[int] = (),
             gates: bool = True, review_tiering: bool = True, low_model: str = "sonnet",
-            fix_rounds: Optional[set[str]] = None) -> dict:
+            fix_rounds: Optional[set[str]] = None, history_dbs: Iterable[str] = (),
+            gate_baseline_s: Optional[float] = None) -> dict:
     """Prediction for running `ids` (default: every task not DONE/CANCELLED). A STALE task with gates that
     is not a review is expected to revalidate (no worker, no time). A task is a fix round if it completed
     before (`fix_rounds`, default: it has a handoff). With review tiering on, a fix-round review is
@@ -184,7 +214,7 @@ def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_
         ids = {t.id for t in graph.tasks.values() if t.state not in (State.DONE.value, State.CANCELLED.value)}
     workers = {t for t in ids if not (graph.tasks[t].state == State.STALE.value and graph.tasks[t].done_when
                                       and graph.tasks[t].kind != Kind.REVIEW.value)}
-    rows = history(store, exclude_usage)
+    rows = history(store, exclude_usage, history_dbs)
     serial = static_serial_points(graph, workers)
     if fix_rounds is None:
         fix_rounds = {t for t in workers if store.latest_handoff(t) is not None}
@@ -195,9 +225,9 @@ def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_
         family = model_family(task.model)
         if task.kind == Kind.REVIEW.value and review_tiering and fix:
             family = model_family(low_model)
-        secs, cost, src = _estimate(task.kind, family, fix, t in serial, rows, task.est_minutes)
+        secs, cost, src, level, n = _estimate(task.kind, family, fix, t in serial, rows, task.est_minutes)
         per[t] = {"seconds": round(secs, 1), "cost": round(cost, 4), "serial": t in serial, "fix_round": fix,
-                  "model": family, "source": src}
+                  "model": family, "source": src, "level": level, "n": n}
     dur = {t: per[t]["seconds"] for t in workers}
     phase_times = []
     for _, group in sorted(_phases(graph, workers, serial).items()):
@@ -207,7 +237,8 @@ def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_
     serial_s = sum(dur[t] for t in serial)
     gate_s = 0.0
     if gates:
-        fg = full_gate_seconds(store, exclude_gate_seq) or 0.0
+        # this repository's own gate time: its recorded full gates, else the `macc init --gate` measurement
+        fg = full_gate_seconds(store, exclude_gate_seq) or gate_baseline_s or 0.0
         n_full = sum(1 for t in workers if graph.tasks[t].kind == Kind.INTEGRATE.value) + 1   # + final gate
         gate_s = fg * n_full
     wall = serial_s + sum(p["seconds"] for p in phase_times) + gate_s
@@ -225,17 +256,100 @@ def error(pred: dict, actual_wall: float, actual_cost: float, actual_serial_shar
 
 def split_hints(pred: dict, floor_s: float) -> list[str]:
     """For each serial point: the k (2-4) that saves most wall time if it were split into k parallel parts,
-    when t·(1 − 1/k) > k·floor (floor = the cheapest worker run's fixed time)."""
+    when t·(1 − 1/k) > k·floor (floor = the cheapest worker run's fixed time). Every hint names the history
+    level and sample count its time rests on; at a coarse level (the kind alone or less) it says so and
+    gives no direction."""
     hints = []
     for t in pred["serial_tasks"]:
-        d = pred["per_task"][t]["seconds"]
+        p = pred["per_task"][t]
+        d = p["seconds"]
+        basis = f"[level {p['level']}: {p['source']}]"
+        if p["level"] >= COARSE_LEVEL:
+            hints.append(f"{t}: serial point, insufficient data for a split direction {basis}")
+            continue
         best = max(((k, d * (1 - 1 / k) - k * floor_s) for k in (2, 3, 4)), key=lambda x: x[1])
         if best[1] > 0:
             hints.append(f"{t}: serial point, predicted {d:.0f} s ({d / pred['wall_s']:.0%} of wall); splitting it "
-                         f"into {best[0]} parallel parts would save ~{best[1]:.0f} s")
+                         f"into {best[0]} parallel parts would save ~{best[1]:.0f} s {basis}")
     return hints
 
 
 def describe(pred: dict) -> str:
     return (f"prediction: wall {pred['wall_s']:.0f} s, cost ${pred['cost_usd']:.2f}, serial share "
             f"{pred['serial_share']:.0%} (serial points: {', '.join(pred['serial_tasks']) or 'none'})")
+
+
+# --------------------------------------------------------------------------- backtest
+def bottleneck_runs(store: Store) -> set[int]:
+    """Runs excluded from the backtest, a fixed rule: a `serial_bottleneck` event, or (runs recorded before
+    that event existed) a serial-point worker that ran > 3x its estimate, the same test the scheduler applies."""
+    conn = store._conn
+    out = {r["run_seq"] for r in conn.execute(
+        "SELECT u.run_seq FROM usage u WHERE u.serial = 1 AND u.est_minutes > 0 "
+        "AND u.seconds > 3 * u.est_minutes * 60 AND u.run_seq IS NOT NULL")}
+    starts = [r["seq"] for r in conn.execute("SELECT seq FROM events WHERE type='run_started' ORDER BY seq")]
+    for r in conn.execute("SELECT seq FROM events WHERE type='serial_bottleneck'"):
+        prior = [x for x in starts if x < r["seq"]]
+        if prior:
+            out.add(prior[-1])
+    return out
+
+
+def backtest(store: Store, history_dbs: Iterable[str] = ()) -> dict:
+    """Predict every finished run of this repository leave-one-out (its own usage rows and gate events are
+    left out of the history) and compare with what happened. Runs with a serial bottleneck are excluded."""
+    reconstruct_serial_flags(store)
+    backfill_fix_rounds(store)
+    conn = store._conn
+    graph = store.load_graph()
+    excluded = bottleneck_runs(store)
+    evs = [dict(e) for e in conn.execute("SELECT seq, type, task_id, payload FROM events ORDER BY seq")]
+    starts = [e for e in evs if e["type"] == "run_started"]
+    rows, skipped = [], []
+    for i, st in enumerate(starts):
+        end = next((e for e in evs if e["seq"] > st["seq"] and e["type"] == "run_finished"
+                    and (i + 1 == len(starts) or e["seq"] < starts[i + 1]["seq"])), None)
+        if end is None:
+            continue
+        run_evs = [e for e in evs if st["seq"] <= e["seq"] <= end["seq"]]
+        usage = conn.execute("SELECT id, seconds, cost_usd, serial FROM usage WHERE run_seq=?", (st["seq"],)).fetchall()
+        if not usage:
+            continue
+        if st["seq"] in excluded:
+            skipped.append({"run_seq": st["seq"], "reason": "serial bottleneck"})
+            continue
+        dispatched = {e["task_id"] for e in run_evs if e["type"] == "dispatched"}
+        no_worker = {e["task_id"] for e in run_evs if e["type"] in ("revalidated", "integrate_skipped")} - dispatched
+        ids = dispatched | no_worker
+        if not ids <= set(graph.tasks):
+            skipped.append({"run_seq": st["seq"], "reason": "tasks no longer in the store"})
+            continue
+        saved = {t: graph.tasks[t].state for t in graph.tasks}
+        for t in graph.tasks.values():
+            t.state = State.DONE.value
+        for t in dispatched:
+            graph.tasks[t].state = State.PENDING.value
+        for t in no_worker:
+            graph.tasks[t].state = State.STALE.value
+        completed = {e["task_id"] for e in evs if e["seq"] < st["seq"]
+                     and e["type"] in ("done", "revalidated", "integrate_skipped")}
+        pred = predict(graph, store, ids=ids, max_parallel=json.loads(st["payload"] or "{}").get("max_parallel", 4),
+                       exclude_usage=[u["id"] for u in usage],
+                       exclude_gate_seq=[e["seq"] for e in run_evs if e["type"] == "full_gate"],
+                       review_tiering=any(e["type"] == "review_tier" for e in run_evs),
+                       fix_rounds=ids & completed, history_dbs=history_dbs)
+        for t, state in saved.items():
+            graph.tasks[t].state = state
+        wall = json.loads(end["payload"])["seconds"]
+        cost = sum(u["cost_usd"] for u in usage)
+        ser = sum(u["seconds"] for u in usage if u["serial"] == 1) / wall if wall else 0.0
+        rows.append({"run_seq": st["seq"], "tasks": len(ids), "pred": {k: pred[k] for k in ("wall_s", "cost_usd",
+                     "serial_share")}, "actual": {"wall_s": wall, "cost_usd": round(cost, 3), "serial_share": round(ser, 3)},
+                     "error": error(pred, wall, cost, ser)})
+    def mean(key):
+        xs = [abs(r["error"][key]) for r in rows if r["error"][key] is not None]
+        return round(sum(xs) / len(xs), 3) if xs else None
+    within = [r for r in rows if r["error"]["wall"] is not None and abs(r["error"]["wall"]) <= 0.3
+              and r["error"]["cost"] is not None and abs(r["error"]["cost"]) <= 0.3]
+    return {"runs": rows, "excluded": skipped, "within_30pct": len(within),
+            "mean_abs_error": {"wall": mean("wall"), "cost": mean("cost"), "serial_share": mean("serial_share")}}

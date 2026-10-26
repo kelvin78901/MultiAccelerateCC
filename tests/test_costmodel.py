@@ -69,12 +69,17 @@ def test_predict_skips_revalidating_tasks_and_falls_back_without_history(tmp_pat
 
 
 def test_error_and_split_hints():
-    pred = {"wall_s": 400.0, "cost_usd": 4.0, "serial_share": 0.9, "serial_tasks": ["c", "r"],
-            "per_task": {"c": {"seconds": 300.0}, "r": {"seconds": 60.0}}}
+    pred = {"wall_s": 400.0, "cost_usd": 4.0, "serial_share": 0.9, "serial_tasks": ["c", "r", "i"],
+            "per_task": {"c": {"seconds": 300.0, "level": 1, "source": "contract/opus/first round as serial point (n=4)"},
+                         "r": {"seconds": 60.0, "level": 2, "source": "review/opus as serial point (n=3)"},
+                         "i": {"seconds": 900.0, "level": 5, "source": "integrate (n=3)"}}}
     assert error(pred, 500, 5.0, 0.8) == {"wall": -0.2, "cost": -0.2, "serial_share": 0.1}
     hints = split_hints(pred, floor_s=21)
-    assert len(hints) == 1 and hints[0].startswith("c: serial point, predicted 300 s (75% of wall)")
+    assert len(hints) == 2                                                     # r: splitting would not pay
+    assert hints[0].startswith("c: serial point, predicted 300 s (75% of wall)")
     assert "into 4 parallel parts would save ~141 s" in hints[0]               # 300·3/4 − 4·21
+    assert hints[0].endswith("[level 1: contract/opus/first round as serial point (n=4)]")
+    assert hints[1] == "i: serial point, insufficient data for a split direction [level 5: integrate (n=3)]"
 
 
 @pytest.fixture
@@ -149,3 +154,41 @@ async def test_run_records_fix_round_live(repo):
     rows = store._conn.execute("SELECT id, task_id, fix_round FROM usage ORDER BY id").fetchall()
     assert all(r["fix_round"] == 0 for r in rows[:n_first])
     assert {r["task_id"]: r["fix_round"] for r in rows[n_first:]} == {"a": 1, "i": 1, "r": 1}
+
+
+def test_history_dbs_pool_worker_rows_but_gate_time_stays_local(tmp_path):
+    local, other = Store(tmp_path / "local.db"), Store(tmp_path / "other.db")
+    seed(other, [("code", 50, 0.3, 0)] * 3)
+    other.event("full_gate", "x", ok=True, seconds=99.0, cmds=["slow"])         # another repo's slow gate
+    g = TaskGraph([Task("a", "a")])
+    alone = predict(g, local, gates=False)["per_task"]["a"]
+    assert alone["source"] == "plan estimate (no history)" and alone["level"] == 7
+    pooled = predict(g, local, history_dbs=[str(tmp_path / "other.db")], gate_baseline_s=1.5)
+    assert pooled["per_task"]["a"]["seconds"] == 50 and pooled["per_task"]["a"]["n"] == 3
+    assert pooled["gate_s"] == 1.5                                              # this repo's baseline, not 99 s
+    local.event("full_gate", "y", ok=True, seconds=4.0, cmds=["local"])
+    assert predict(g, local, history_dbs=[str(tmp_path / "other.db")], gate_baseline_s=1.5)["gate_s"] == 4.0
+    assert predict(g, local, history_dbs=[str(tmp_path / "missing.db")], gates=False)["per_task"]["a"]["level"] == 7
+
+
+async def test_backtest_excludes_bottleneck_runs_and_maps_runs(repo):
+    from macc.costmodel import backtest, bottleneck_runs
+    store = Store(repo.macc_dir / "state.db")
+    g = diamond()
+    g.validate()
+    cfg = SchedulerConfig(integration_gates=["true"], skip_noop_integrate=False)
+    await Scheduler(repo, store, g, MockWorker(), cfg).run()
+    g.update_spec("a", g.tasks["a"].spec + " (changed)")
+    await Scheduler(repo, store, g, MockWorker(), cfg).run()
+    runs = [r["seq"] for r in store._conn.execute("SELECT seq FROM events WHERE type='run_started' ORDER BY seq")]
+    rows = store._conn.execute("SELECT run_seq FROM usage").fetchall()
+    assert {r["run_seq"] for r in rows} == set(runs)                            # recorded live
+    store._conn.execute("UPDATE usage SET run_seq = NULL")
+    reconstruct_serial_flags(store)
+    assert {r["run_seq"] for r in store._conn.execute("SELECT run_seq FROM usage")} == set(runs)
+    res = backtest(store)
+    assert [r["run_seq"] for r in res["runs"]] == runs and res["excluded"] == []
+    # retroactive rule: a serial worker that ran > 3x its estimate marks its run as a bottleneck
+    store._conn.execute("UPDATE usage SET est_minutes = 0.0001 WHERE task_id = 'c'")
+    assert bottleneck_runs(store) == {runs[0]}
+    assert backtest(store)["excluded"] == [{"run_seq": runs[0], "reason": "serial bottleneck"}]

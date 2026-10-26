@@ -49,8 +49,10 @@ class SchedulerConfig:
     review_low_risk_max_new_api: int = 5         # new public defs/classes/routes; features add 17-31, the refactor 4
     plan_base: Optional[str] = None              # integration HEAD when the plan was loaded: "this plan's change"
     flake_check_runs: int = 3                    # at integrate: run this plan's new test files N times, random seeds
-    # cost-model split hints stay off until its backtest error is within 30% (v0.3.5: mean wall error 32%)
-    split_hints: bool = False
+    # cost-model split hints: each names the history level and sample count it rests on (v0.3.7)
+    split_hints: bool = True
+    history_dbs: list[str] = field(default_factory=list)   # other repos' state.db: worker history for the cost model
+    gate_baseline_s: Optional[float] = None      # this repo's gate time measured by `macc init --gate`
     review_low_model: str = "sonnet"
     review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
@@ -84,6 +86,7 @@ class Scheduler:
         self._serial_points: set[str] = set()     # tasks every other unfinished task waited for (this run)
         self.prediction: Optional[dict] = None
         self._fix_round: dict[str, bool] = {}
+        self.run_seq: Optional[int] = None
         self.serial_seconds = 0.0
         self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
         self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
@@ -380,7 +383,8 @@ class Scheduler:
                              input_tokens=res.input_tokens, output_tokens=res.output_tokens,
                              cache_read_tokens=res.cache_read_tokens, cost_usd=res.cost_usd, seconds=res.seconds,
                              est_minutes=t.est_minutes, kind=t.kind, serial=tid in self._serial_points,
-                             fix_round=self._fix_round.get(tid), **self._predicted_for(tid))
+                             fix_round=self._fix_round.get(tid), run_seq=self.run_seq,
+                             **self._predicted_for(tid))
 
         if res.preempted or t.preempt:
             t.attempts = max(0, t.attempts - 1)       # a preempted run is not a failed attempt
@@ -784,12 +788,16 @@ class Scheduler:
         self._reset_orphans()
         self.graph.refresh_hashes()
         self._persist()
-        self.emit("run_started", None, tasks=len(self.graph.tasks), max_parallel=self.cfg.max_parallel)
+        self.run_seq = self.store.event("run_started", None, tasks=len(self.graph.tasks),
+                                        max_parallel=self.cfg.max_parallel)
+        if self._on_event:
+            self._on_event("run_started", None, {"tasks": len(self.graph.tasks), "max_parallel": self.cfg.max_parallel})
         try:
             reconstruct_serial_flags(self.store)
             backfill_fix_rounds(self.store)
             self.prediction = predict(self.graph, self.store, max_parallel=self.cfg.max_parallel,
-                                      review_tiering=self.cfg.review_tiering, low_model=self.cfg.review_low_model)
+                                      review_tiering=self.cfg.review_tiering, low_model=self.cfg.review_low_model,
+                                      history_dbs=self.cfg.history_dbs, gate_baseline_s=self.cfg.gate_baseline_s)
             self.emit("prediction", None, **{k: v for k, v in self.prediction.items() if k != "per_task"})
         except Exception as e:                  # the model only reports; it must never stop a run
             self.prediction = None

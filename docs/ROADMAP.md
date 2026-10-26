@@ -101,12 +101,72 @@ What this says:
   from tests merged before their implementation (fixed by `merge_after`), 1 out-of-scope commit
   caught by review (fixed by scoped commits), 1 REJECT → reopen → APPROVE.
 
-## v0.3 — impact analysis and cost model
-- [ ] Code dependency graph via ast-grep / import scan per language; map files → tasks via `owns`.
-- [ ] Change impact: a changed file invalidates tasks that *read* it, not only those that depend on the task.
-- [ ] Cost model for split/no-split, calibrated from `usage` table (per kind: tokens, seconds, success rate,
-      and `est_minutes` vs actual: the first real run came in far under the planner's estimates).
-- [ ] Dynamic decomposition by a planner call when a task's estimate exceeds a threshold.
+### Four real runs on AutoLeaseRank (the v0.3 baseline)
+Source: `AutoLeaseRank/.macc/state.db`. Serial share = worker time in tasks that every other unfinished
+task of the run was waiting for, divided by wall time (recorded by macc from v0.2.12; the first three
+runs reconstructed from the event log with the same definition; the refactor's reconstruction matches
+the recorded 0.877). Wall excludes the planner call.
+
+| run | tasks (with a worker) | wall | worker sum | worker/wall | serial share (serial nodes) | cost | review | tests |
+|---|---|---|---|---|---|---|---|---|
+| watch r1 (new feature) | 9 (9) | 585 s | 715 s | 1.22x | 71% (contract, integrate, review) | $4.05 + $1.02 plan | 172 s / $1.03 | +51 (2→53) |
+| watch r2 (review fixes via `change`) | 4 (3) | 144 s | 166 s | 1.15x | 75% (review) | $1.05 | 108 s / $0.73 | +6 (53→59) |
+| insights (new feature, 4-way fan-out) | 12 (12) | 1683 s | 1934 s | 1.15x | 94% (contract, integrate, review) | $5.65 + $1.35 plan | 152 s / $1.19 | +88 (59→147) |
+| error-handler refactor | 6 (6) | 425 s | 494 s | 1.16x | 88% (contract, integrate, review) | $3.51 + $0.79 plan | 188 s / $1.35 | +66 (147→213) |
+| **total** | 31 (30) | 2837 s | 3309 s | 1.17x | 87% | $14.26 + $3.16 plan | 620 s / $4.30 | +211 |
+
+Read-outs: the speed-up is ~1.2x in every shape of run, because 71-94% of wall time is spent in serial
+nodes; the reviews alone are 22% of wall and 30% of run cost; the cheapest possible worker run (a
+small sonnet code task) is ~21 s and ~$0.16, so that is the floor every extra task pays.
+
+## v0.3 — proposal (data-driven; not implemented)
+
+**1. Cost model: wall = serial chain + widest parallel phase + gates.** Model the plan as phases
+separated by serial nodes (a node every remaining task waits for). Predicted wall =
+Σ serial-node time + Σ over phases of (max branch time in the phase) + gate time per merge; predicted
+cost = Σ per-run cost. Per-task time and cost come from `usage` by kind and model (median, with the
+plan's est_minutes only as a weak prior: actual/est has ranged 0.02-1.7). Weighting: a serial node
+counts at 1.0 for wall; a task inside a parallel phase counts only through the phase maximum, so its
+wall weight is ~0 unless it *is* the maximum. Every task, serial or not, counts 1.0 for cost plus the
+~$0.16 / 21 s floor. Decisions this enables, all deterministic:
+- Split a task into k parallel parts only if it is a serial node or the phase maximum, and
+  t · (1 − 1/k) > k · 21 s. Otherwise splitting only adds cost (the insights 4-way fan-out saved ~4 min
+  of a 28 min run; the contract alone was 22 min).
+- Refuse or flag plans whose predicted serial share is above ~80% when the description promises
+  independent modules: the planner put the work in the wrong place.
+- Budget reservations and `serial_bottleneck` use the same per-kind numbers (already partly true).
+
+**2. Cut the serial overhead, biggest first.**
+- *Review (largest single node, 108-188 s, $0.73-1.35, 30% of cost).*
+  (a) Tier it by risk: diff size, files touched and whether public interfaces changed decide sonnet vs
+  opus and effort; the refactor's review (behaviour-preserving, fully gated) did not need opus/high.
+  (b) Hand it facts instead of letting it rediscover them: the full-gate result is already passed on;
+  add the diff stat, the contract checklist and the debt list, and forbid re-running the suite
+  (the watch r1 and refactor reviews re-ran it; the insights review, told by the v0.2.9 full-gate note,
+  did not, and spent its time on probes instead).
+  (c) Make round 2+ incremental: review only the files changed since the rejected round (watch r2 was
+  108 s against 172 s; it can go lower).
+  (d) Overlap it: once every code task has merged and integrate is predicted to be a no-op, start the
+  review then, not after integrate (already a no-op with v0.2.13's skip, so this mostly applies when
+  integrate must run).
+- *Contract.* Keep the v0.2.12 limits; additionally merge contract and implementation into one task
+  when only one task consumes the contract (the refactor: one impl, 111 s of contract for it).
+- *Integrate.* v0.2.13 skips the no-op case; next, let integrate start from the failing gate output
+  only (it currently re-reads the whole change).
+- *Planner.* $0.79-1.35 and 150-320 s per feature (18% of cost): reuse its repository reading across
+  `plan --from` calls in the same repo (file list, contracts, gate) and skip re-reading what has not
+  changed since the last plan.
+
+**3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
+what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus
+the review, and integrate was revalidated by its gates; wall time there was 75% review. Nothing in the
+four runs was slowed by over-invalidation. Build the graph only when a run shows stale_rerun or
+revalidation work that an import graph would have avoided; until then a cheap per-language import scan
+is enough to warn when two parallel tasks' owns import each other.
+
+**4. Dynamic decomposition: only on the serial chain.** Split a running plan only when
+`serial_bottleneck` fires on a node the cost model says is splittable (rule in 1); never decompose
+parallel-phase tasks.
 
 ## v0.4 — benchmark harness
 - [ ] Paired runs: native Claude Code vs macc on (a) SWE-bench Lite subset with `--parallel 1`,

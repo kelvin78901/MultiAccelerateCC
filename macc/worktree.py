@@ -15,10 +15,11 @@ import hashlib
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 INTEGRATION_BRANCH = "macc/integration"
 
@@ -35,8 +36,8 @@ ARTIFACT_SUFFIXES = (".pyc", ".pyo", ".class", ".o", ".log")
 
 def _is_artifact(p: str) -> bool:
     """Match whole path segments only: `build/x` yes, `tools/rebuild/x.py` no."""
-    parts = p.split("/")
-    if any(seg in ARTIFACT_DIRS for seg in parts[:-1]):
+    parts = p.rstrip("/").split("/")
+    if any(seg in ARTIFACT_DIRS for seg in parts[:-1]) or parts[-1] in ARTIFACT_DIRS:   # incl. a symlinked dir
         return True
     return parts[-1] in ARTIFACT_FILES or p.endswith(ARTIFACT_SUFFIXES)
 
@@ -70,6 +71,11 @@ class Repo:
         self.root = Path(root).resolve()
         self.macc_dir = self.root / ".macc"
         self.wt_dir = self.macc_dir / "worktrees"
+        self.gate_timeout = 1800                  # seconds per gate command (config gate_timeout)
+        # gate results per (tree hash, command) for this process: an identical gate on an identical tree
+        # waits for the one in flight or reuses its result instead of running again (large repos: minutes)
+        self._gate_lock = threading.Lock()
+        self._gate_runs: dict[tuple[str, str], dict] = {}
 
     # ------------------------------------------------------------------ git
     def git(self, *args: str, cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -234,13 +240,15 @@ class Repo:
             paths.append(p)
         return paths
 
-    def commit_scoped(self, path: Path, message: str, owns: list[str]) -> "ScopedCommit":
-        """Stage only paths inside `owns` (build artifacts are ignored), commit them, and report
-        what was left outside the scope. An empty `owns` means everything is in scope."""
+    def commit_scoped(self, path: Path, message: str, owns: list[str],
+                      setup_paths: Iterable[str] = ()) -> "ScopedCommit":
+        """Stage only paths inside `owns` (build artifacts and whatever worktree_setup created are ignored),
+        commit them, and report what was left outside the scope. An empty `owns` means everything is in scope."""
         dirty = self.dirty_paths(path)
+        setup = set(setup_paths)
         inside, outside, ignored = [], [], []
         for p in dirty:
-            if _is_artifact(p):
+            if _is_artifact(p) or p in setup or p.rstrip("/") in setup:
                 ignored.append(p)
             elif not owns or any(_path_in_glob(p, g) for g in owns):
                 inside.append(p)
@@ -255,7 +263,8 @@ class Repo:
         if outside or ignored:
             # leave the tree clean for rebase/merge; nothing of these reaches the integration branch
             self.git("checkout", "--", ".", cwd=path, check=False)
-            self.git("clean", "-fdq", cwd=path, check=False)
+            keep = [x for p in sorted(setup) for x in ("-e", "/" + p.rstrip("/"))]   # setup output stays
+            self.git("clean", "-fdq", *keep, cwd=path, check=False)
         return ScopedCommit(committed=committed, inside=inside, outside=outside, ignored=ignored)
 
     # ---------------------------------------------------------------- diffs
@@ -340,20 +349,65 @@ class Repo:
         self.git("add", "-A", cwd=path)
         self.git("commit", "-q", "-m", f"macc({task_id}): resolve conflicts with integration", cwd=path)
 
-    def run_gates(self, commands: list[str], cwd: Optional[Path] = None, timeout: int = 1800) -> list[dict]:
-        """Run deterministic gate commands (tests, lint, type-check). Returns one record per command."""
+    def _clean_tree(self, cwd: Path) -> Optional[str]:
+        """Tree hash of HEAD when the worktree has no changes at all (else None: results are not shareable)."""
+        st = self.git("status", "--porcelain", "--untracked-files=normal", cwd=cwd, check=False)
+        if st.returncode != 0 or st.stdout.strip():
+            return None
+        return self.tree(cwd)
+
+    def run_gates(self, commands: list[str], cwd: Optional[Path] = None, timeout: Optional[int] = None) -> list[dict]:
+        """Run deterministic gate commands (tests, lint, type-check). Returns one record per command.
+        On a clean tree a (tree, command) pair runs once per process: concurrent callers wait for it and
+        later callers reuse its record (marked "shared": true)."""
         results = []
+        where = cwd or self.integration_path
         env = {**os.environ, **self.macc_env()} if commands else None
+        tree = self._clean_tree(where) if commands else None
+        for cmd in commands:
+            rec = self._gate_once(tree, cmd, where, env, timeout or self.gate_timeout)
+            results.append(rec)
+            if not rec["ok"]:
+                break
+        return results
+
+    def _gate_once(self, tree: Optional[str], cmd: str, where: Path, env: dict, timeout: int) -> dict:
+        key = (tree, cmd) if tree else None
+        if key is not None:
+            with self._gate_lock:
+                slot = self._gate_runs.get(key)
+                owner = slot is None
+                if owner:
+                    slot = self._gate_runs[key] = {"done": threading.Event(), "rec": None}
+            if not owner:
+                slot["done"].wait()
+                return {**slot["rec"], "shared": True}
+        t0 = time.time()
+        try:
+            p = subprocess.run(cmd, shell=True, cwd=str(where), capture_output=True, text=True,
+                               timeout=timeout, env=env)
+            rec = {"cmd": cmd, "ok": p.returncode == 0, "code": p.returncode,
+                   "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
+        except subprocess.TimeoutExpired:
+            rec = {"cmd": cmd, "ok": False, "code": -1, "stdout": "", "stderr": f"timeout after {timeout} s"}
+        rec["seconds"] = round(time.time() - t0, 2)
+        if key is not None:
+            slot["rec"] = rec
+            slot["done"].set()
+        return rec
+
+    def run_setup(self, commands: list[str], cwd: Path) -> Optional[dict]:
+        """Run worktree_setup commands in a fresh worktree (e.g. link the main checkout's node_modules).
+        They get MACC_REPO_ROOT and MACC_WORKTREE. Returns the failing record, or None."""
+        env = {**os.environ, **self.macc_env(), "MACC_REPO_ROOT": str(self.root), "MACC_WORKTREE": str(cwd)}
         for cmd in commands:
             t0 = time.time()
             try:
-                p = subprocess.run(cmd, shell=True, cwd=str(cwd or self.integration_path),
-                                   capture_output=True, text=True, timeout=timeout, env=env)
-                results.append({"cmd": cmd, "ok": p.returncode == 0, "code": p.returncode,
-                                "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]})
+                p = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True, text=True,
+                                   timeout=self.gate_timeout, env=env)
+                if p.returncode != 0:
+                    return {"cmd": cmd, "code": p.returncode, "stdout": p.stdout[-2000:], "stderr": p.stderr[-2000:],
+                            "seconds": round(time.time() - t0, 2)}
             except subprocess.TimeoutExpired:
-                results.append({"cmd": cmd, "ok": False, "code": -1, "stdout": "", "stderr": "timeout"})
-            results[-1]["seconds"] = round(time.time() - t0, 2)
-            if not results[-1]["ok"]:
-                break
-        return results
+                return {"cmd": cmd, "code": -1, "stdout": "", "stderr": "timeout", "seconds": round(time.time() - t0, 2)}
+        return None

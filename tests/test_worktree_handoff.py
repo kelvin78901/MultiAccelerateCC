@@ -299,3 +299,45 @@ def test_worker_protocol_separates_questions_from_notes(tmp_path):
     assert "deviation from the task text you already handled" in pack and "never in open_questions" in pack
     from macc.planner import PLANNER_PROMPT
     assert "resolved deviations and explanations go to\n    notes_for_downstream" in PLANNER_PROMPT
+
+
+def test_identical_gates_on_a_clean_tree_run_once_even_concurrently(repo, tmp_path):
+    import threading
+    count = tmp_path / "count.txt"
+    cmd = f"sleep 0.3; echo x >> {count}"
+    ipath = repo.ensure_integration()
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(repo.run_gates([cmd])[0])) for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert count.read_text().count("x") == 1                       # ran once, two callers waited for it
+    assert sum(1 for r in results if r.get("shared")) == 2 and all(r["ok"] for r in results)
+    assert repo.run_gates([cmd])[0]["shared"] is True                # later caller: reused
+    (ipath / "dirty.txt").write_text("uncommitted\n")
+    assert "shared" not in repo.run_gates([cmd])[0]                   # a dirty tree never shares results
+    assert count.read_text().count("x") == 2
+
+
+def test_gate_timeout_is_configurable(repo):
+    repo.ensure_integration()
+    repo.gate_timeout = 1
+    rec = repo.run_gates(["sleep 3"])[0]
+    assert rec["ok"] is False and rec["stderr"] == "timeout after 1 s"
+
+
+def test_setup_created_paths_and_symlinked_artifact_dirs_are_not_committed(repo):
+    wa = repo.create_task_worktree("a")
+    (wa / "node_modules").symlink_to(repo.root)                      # a symlinked dependency dir
+    (wa / "venv_link").symlink_to(repo.root)                         # something a setup command made
+    (wa / "a.py").write_text("x = 1\n")
+    sc = repo.commit_scoped(wa, "a", ["a.py"], setup_paths={"venv_link"})
+    assert sc.inside == ["a.py"] and sc.outside == []
+    assert set(sc.ignored) == {"node_modules", "venv_link"}
+
+
+def test_spike_context_pack_asks_for_sources_and_facts(tmp_path):
+    g = TaskGraph([Task("s", "s", kind="spike", owns=["docs/spikes/**"])])
+    pack = build_context_pack(g.tasks["s"], g, Store(tmp_path / "s.db"))
+    assert "the only kind of task that can" in pack and "source URL" in pack and "docs/spikes/s.md" in pack

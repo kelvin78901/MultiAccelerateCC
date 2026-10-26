@@ -116,6 +116,9 @@ Rules for commands in `done_when` / `integration_gates`:
   owned paths are committed); guard with `git diff --quiet $MACC_BASE -- <paths>` only for paths that no
   task in the plan owns.
 
+# Repository guides (workers follow these; plan tasks that respect them)
+{GUIDES}
+
 # Measured history in this repo (worker time per run, from macc's usage table)
 {HISTORY}
 
@@ -309,6 +312,46 @@ def format_history(history: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+FILE_LIST_LIMIT = 300
+GUIDE_FILES = ("AGENTS.md", "CONTRIBUTING.md", "CLAUDE.md")
+GUIDE_MAX_CHARS = 6000
+
+
+def tree_digest(files: list[str], max_lines: int = 250) -> str:
+    """A large repository as directories: file count and main extensions per directory (two levels deep)."""
+    dirs: dict[str, list[str]] = {}
+    for f in files:
+        parts = f.split("/")
+        d = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if len(parts) > 1 else ".")
+        dirs.setdefault(d, []).append(f)
+    lines = [f"({len(files)} files; directory: file count, main extensions)"]
+    for d in sorted(dirs):
+        exts: dict[str, int] = {}
+        for f in dirs[d]:
+            name = f.rsplit("/", 1)[-1]
+            ext = name.rsplit(".", 1)[-1] if "." in name.lstrip(".") else "(none)"
+            exts[ext] = exts.get(ext, 0) + 1
+        top = ", ".join(f".{e} {n}" if e != "(none)" else f"{e} {n}"
+                        for e, n in sorted(exts.items(), key=lambda x: (-x[1], x[0]))[:3])
+        lines.append(f"- {d}/: {len(dirs[d])} ({top})")
+    if len(lines) > max_lines + 1:
+        lines = lines[:max_lines + 1] + [f"- ... {len(lines) - 1 - max_lines} more directories"]
+    return "\n".join(lines)
+
+
+def repo_guides(workdir: Path) -> str:
+    """AGENTS.md / CONTRIBUTING.md / CLAUDE.md as the workers will see them (truncated)."""
+    parts = []
+    for name in GUIDE_FILES:
+        p = workdir / name
+        if p.is_file():
+            text = p.read_text(errors="replace")
+            if len(text) > GUIDE_MAX_CHARS:
+                text = text[:GUIDE_MAX_CHARS] + f"\n... ({len(text) - GUIDE_MAX_CHARS} more characters in {name})"
+            parts.append(f"## {name}\n{text.strip()}")
+    return "\n\n".join(parts) or "(none of AGENTS.md, CONTRIBUTING.md, CLAUDE.md)"
+
+
 @dataclass
 class PlanResult:
     graph: TaskGraph
@@ -326,11 +369,11 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
     files = existing_files if existing_files is not None else sorted(
         str(p.relative_to(workdir)) for p in workdir.rglob("*")
         if p.is_file() and ".git" not in p.parts and ".macc" not in p.parts)
-    listing = "\n".join(f"- {f}" for f in files[:300]) or "- (empty)"
-    if len(files) > 300:
-        listing += f"\n- ... {len(files) - 300} more"
+    listing = ("\n".join(f"- {f}" for f in files) or "- (empty)") if len(files) <= FILE_LIST_LIMIT \
+        else tree_digest(files)
     prompt = (PLANNER_PROMPT.replace("{BEGIN}", PLAN_BEGIN).replace("{END}", PLAN_END)
               .replace("{DESCRIPTION}", description).replace("{FILES}", listing)
+              .replace("{GUIDES}", repo_guides(workdir))
               .replace("{GATE}", current_gate or "(none configured)")
               .replace("{HISTORY}", format_history(history)))
     task = Task(id="_plan", title="plan", kind="plan", effort=effort, model=model, owns=[])

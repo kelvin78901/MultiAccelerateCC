@@ -160,3 +160,33 @@ def test_review_spec_must_not_rerun_the_full_suite():
         validate_plan(plan)
     from macc.planner import PLANNER_PROMPT
     assert "A review spec never asks to run the full test suite" in PLANNER_PROMPT
+
+
+async def test_planner_gets_a_tree_digest_and_repo_guides(tmp_path):
+    from macc.planner import tree_digest
+    files = [f"src/fmt{i % 7}/file{i}.ts" for i in range(320)] + ["README.md", "docs/a.md", "package.json"]
+    digest = tree_digest(files)
+    assert digest.startswith("(323 files;") and "- src/fmt0/: 46 (.ts 46)" in digest and "- ./: 2 (.json 1, .md 1)" in digest
+    (tmp_path / "AGENTS.md").write_text("Use Result types, never throw.\n")
+    (tmp_path / "CONTRIBUTING.md").write_text("x" * 7000)
+    seen = []
+
+    class Spy(MockWorker):
+        async def __call__(self, task, wt, pack):
+            seen.append(pack)
+            return await super().__call__(task, wt, pack)
+
+    await generate_plan("feature", tmp_path, Spy(), tmp_path / "p.yaml", existing_files=files)
+    pack = seen[0]
+    assert "(323 files;" in pack and "src/fmt3/file3.ts" not in pack          # digest, not the listing
+    assert "## AGENTS.md\nUse Result types, never throw." in pack
+    assert "more characters in CONTRIBUTING.md" in pack and "CLAUDE.md" not in pack.split("## CONTRIBUTING.md")[1][:200]
+    small = []
+
+    class Spy2(MockWorker):
+        async def __call__(self, task, wt, pack):
+            small.append(pack)
+            return await super().__call__(task, wt, pack)
+
+    await generate_plan("feature", tmp_path, Spy2(), tmp_path / "q.yaml", existing_files=["a.py", "b.py"])
+    assert "- a.py\n- b.py" in small[0]

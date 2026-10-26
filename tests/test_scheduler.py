@@ -980,3 +980,52 @@ async def test_flaky_new_tests_block_the_integrate_skip(repo):
     t = s.graph.tasks["i"]
     assert s._try_skip_integrate(t) is False                       # full gate green, but new tests are flaky
     assert "new tests are flaky" in t.last_error
+
+
+async def test_worktree_setup_runs_in_task_and_integration_worktrees(repo):
+    shared = repo.root.parent / "shared_deps"
+    shared.mkdir()
+    (shared / "dep.txt").write_text("dep\n")
+    seen = {}
+    worker = MockWorker()
+    orig = worker.__call__
+
+    async def w(task, wt, pack):
+        seen[task.id] = (wt / "node_modules" / "dep.txt").is_file()
+        return await orig(task, wt, pack)
+    w.name = "mock"
+    setup = [f"ln -sfn {shared} node_modules"]
+    s, store, g, _, events, summary = await run(
+        repo, [Task("a", "a", owns=["a/**"], done_when=["test -f node_modules/dep.txt"])], worker=w,
+        integration_gates=["test -f node_modules/dep.txt"], worktree_setup=setup)
+    assert summary["finished"] and seen == {"a": True}               # the worker and its gate saw the link
+    assert (repo.integration_path / "node_modules" / "dep.txt").is_file()
+    assert not [p for p in subprocess.run(["git", "ls-files"], cwd=repo.integration_path, capture_output=True,
+                                          text=True).stdout.split() if p.startswith("node_modules")]
+
+
+async def test_worktree_setup_failure_blocks_the_task_without_charging(repo):
+    calls = {"n": 0}
+
+    async def w(task, wt, pack):
+        calls["n"] += 1
+        return await MockWorker()(task, wt, pack)
+    w.name = "mock"
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph([Task("a", "a", owns=["a/**"])]); g.validate()
+    events = []
+    s = Scheduler(repo, store, g, w, SchedulerConfig(worktree_setup=["test -f /nonexistent/setup_marker"]),
+                  on_event=lambda t, tid, p: events.append((t, tid, p)))
+    summary = await s.run()                                          # integration setup fails first
+    assert summary["stopped_reason"] == "worktree_setup_failed" and calls["n"] == 0
+    assert any(t == "worktree_setup_failed" and p.get("where") == "integration" for t, tid, p in events)
+    # integration ok, task worktree fails: BLOCKED, attempt not charged
+    marker = repo.integration_path / "only_here"
+    marker.write_text("x\n")
+    s2 = Scheduler(repo, store, g, w, SchedulerConfig(worktree_setup=[f"test -f {marker} && test -d .macc_never"]),
+                   on_event=lambda t, tid, p: events.append((t, tid, p)))
+    s2.cfg.worktree_setup = ["test \"$MACC_WORKTREE\" != \"$MACC_REPO_ROOT/.macc/worktrees/a\""]
+    summary = await s2.run()
+    assert g.tasks["a"].state == State.BLOCKED.value and g.tasks["a"].attempts == 0 and calls["n"] == 0
+    assert "worktree_setup failed" in g.tasks["a"].last_error
+    assert any(t == "worktree_setup_failed" and tid == "a" for t, tid, p in events)

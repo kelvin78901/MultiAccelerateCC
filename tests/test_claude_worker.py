@@ -122,9 +122,25 @@ async def test_reviewer_allowlist_handles_env_prefixed_gates(tmp_path, monkeypat
     w = ClaudeWorker(binary=str(fake))
     w.gate_commands = ["PYTHONPATH=. /p/.venv/bin/python -m pytest -q tests"]
     await w(Task("r", "r", kind="review", done_when=["FOO=1 BAR=2 make check"]), wt, "p")
-    allowed = args_file.read_text().split("--allowedTools ")[1].strip().split(",")
+    allowed = args_file.read_text().split("--allowedTools ")[1].split(" --")[0].strip().split(",")
     assert "Bash(/p/.venv/bin/python:*)" in allowed                    # the interpreter itself (probes)
     assert "Bash(PYTHONPATH=. /p/.venv/bin/python:*)" in allowed       # and with the gate's env prefix
     assert "Bash(make check:*)" in allowed and "Bash(FOO=1 BAR=2 make check:*)" in allowed
     assert "Bash(PYTHONPATH=.:*)" not in allowed                       # the old accidental rule
     assert not any(a.startswith(("Edit", "Write")) for a in allowed)
+
+
+def test_network_tools_by_kind():
+    w = ClaudeWorker()
+    def tools(kind):
+        cmd = w._cmd(Task("t", "t", kind=kind))
+        allowed = cmd[cmd.index("--allowedTools") + 1].split(",")
+        denied = cmd[cmd.index("--disallowedTools") + 1].split(",") if "--disallowedTools" in cmd else []
+        return allowed, denied
+    a, d = tools("spike")
+    assert {"WebSearch", "WebFetch"} <= set(a) and not d
+    a, d = tools("plan")
+    assert "WebSearch" in a and "WebFetch" not in a and d == ["WebFetch"]
+    for kind in ("code", "contract", "integrate", "merge", "review"):
+        a, d = tools(kind)
+        assert not {"WebSearch", "WebFetch"} & set(a) and set(d) == {"WebFetch", "WebSearch"}, kind

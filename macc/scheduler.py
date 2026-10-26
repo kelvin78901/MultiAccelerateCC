@@ -51,6 +51,8 @@ class SchedulerConfig:
     flake_check_runs: int = 3                    # at integrate: run this plan's new test files N times, random seeds
     # cost-model split hints: each names the history level and sample count it rests on (v0.3.7)
     split_hints: bool = True
+    worktree_setup: list[str] = field(default_factory=list)   # run in every new worktree (e.g. link node_modules)
+    gate_timeout: int = 1800                     # seconds per gate command
     history_dbs: list[str] = field(default_factory=list)   # other repos' state.db: worker history for the cost model
     gate_baseline_s: Optional[float] = None      # this repo's gate time measured by `macc init --gate`
     review_low_model: str = "sonnet"
@@ -83,6 +85,7 @@ class Scheduler:
         self._merged_since_full_gate = False      # per_task policy: the final full gate is still owed
         self.gate_seconds = 0.0                   # wall time spent in post-merge gates this run
         self._budget_deferred: set[str] = set()
+        self._setup_paths: dict[str, set[str]] = {}   # per task: paths worktree_setup created
         self._serial_points: set[str] = set()     # tasks every other unfinished task waited for (this run)
         self.prediction: Optional[dict] = None
         self._fix_round: dict[str, bool] = {}
@@ -244,6 +247,8 @@ class Scheduler:
         return True
 
     def _dispatch_ready(self) -> int:
+        if self.stopped_reason == "worktree_setup_failed":
+            return 0
         # skipping an integrate makes its dependents ready at once (a STALE review must first go back to
         # pending, or the run ends with it never dispatched): repeat until nothing more is skipped
         while any(self._try_skip_integrate(t) for t in self.graph.ready()
@@ -298,6 +303,18 @@ class Scheduler:
         t.worker = self._worker_name()
         t.branch = self.repo.task_branch(t.id)
         wt = self.repo.create_task_worktree(t.id, fresh=True)
+        if self.cfg.worktree_setup:
+            bad = self.repo.run_setup(self.cfg.worktree_setup, wt)
+            if bad:
+                t.attempts = max(0, t.attempts - 1)       # the environment failed, not the task
+                t.state = State.BLOCKED.value
+                t.last_error = (f"worktree_setup failed: {bad['cmd']} (exit {bad['code']})\n"
+                                f"{bad['stderr'][-800:]}{bad['stdout'][-800:]}")
+                self._persist(t.id)
+                self.emit("worktree_setup_failed", t.id, cmd=bad["cmd"], code=bad["code"], stderr=bad["stderr"][-300:])
+                self._cleanup(t.id)
+                return
+            self._setup_paths[t.id] = set(self.repo.dirty_paths(wt))   # environment, never the task's output
         head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
         tree = self.repo.tree(self.repo.integration_path) if head else None
         pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head,
@@ -418,7 +435,8 @@ class Scheduler:
 
         # 1. commit the worktree: only paths the task owns; build artifacts are discarded;
         #    anything else outside the scope is an ownership violation (Bash bypasses the Edit hook)
-        sc = self.repo.commit_scoped(wt, f"macc({tid}): attempt {t.attempts}", t.owns)
+        sc = self.repo.commit_scoped(wt, f"macc({tid}): attempt {t.attempts}", t.owns,
+                                     setup_paths=self._setup_paths.get(tid, ()))
         committed = sc.committed
         if sc.ignored:
             self.emit("artifacts_discarded", tid, paths=sc.ignored[:20])
@@ -442,7 +460,7 @@ class Scheduler:
             return
 
         # 2. task-level gates (done_when) inside the worktree
-        gates = self.repo.run_gates(t.done_when, cwd=wt) if t.done_when else []
+        gates = await asyncio.to_thread(self.repo.run_gates, t.done_when, wt) if t.done_when else []
         if gates and not all(g["ok"] for g in gates):
             bad = next(g for g in gates if not g["ok"])
             self._fail(t, f"gate failed: {bad['cmd']}\n{bad['stderr'][-1500:]}\n{bad['stdout'][-1500:]}")
@@ -541,7 +559,7 @@ class Scheduler:
                 # the rebase was a no-op: integration now holds exactly the tree the task's gates passed on
                 self.emit("gate_reused", tid, cmds=cmds)
                 cmds = []
-            igates = self.repo.run_gates(cmds) if cmds else []
+            igates = await asyncio.to_thread(self.repo.run_gates, cmds) if cmds else []
             self._record_gates(tid, igates, full)
             if igates and not all(g["ok"] for g in igates):
                 self.repo.git("reset", "--hard", before, cwd=self.repo.integration_path)
@@ -785,6 +803,13 @@ class Scheduler:
 
     async def run(self) -> dict:
         self.repo.ensure_integration()
+        self.repo.gate_timeout = self.cfg.gate_timeout
+        if self.cfg.worktree_setup:                   # the gates run in the integration worktree too
+            bad = self.repo.run_setup(self.cfg.worktree_setup, self.repo.integration_path)
+            if bad:
+                self.stopped_reason = "worktree_setup_failed"
+                self.emit("worktree_setup_failed", None, where="integration", cmd=bad["cmd"], code=bad["code"],
+                          stderr=bad["stderr"][-300:])
         self._reset_orphans()
         self.graph.refresh_hashes()
         self._persist()

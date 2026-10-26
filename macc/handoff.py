@@ -321,8 +321,11 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         f"{task.spec.strip()}"
     )
     if task.kind == "spike":
-        parts.append("# Spike output\nDo not write production code. Write your conclusion to "
-                     "`docs/spikes/" + task.id + ".md` and summarise it in notes_for_downstream.")
+        parts.append("# Spike output\nDo not write production code. You may search and read the web (the only "
+                     "kind of task that can). Write `docs/spikes/" + task.id + ".md` for the tasks after you, who "
+                     "cannot go online: the conclusion, the exact facts they need (field layouts, constants, "
+                     "error cases, version differences, copied verbatim where it matters), and the source URL "
+                     "and section for each fact. Summarise it in notes_for_downstream.")
     if task.kind == "contract":
         downstream = [graph.tasks[d] for d in sorted(graph.descendants(task.id))]
         owned = "\n".join(f"- {d.id}: {d.owns}" for d in downstream if d.owns)

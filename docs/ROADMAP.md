@@ -273,6 +273,14 @@ The four original runs: all three that count are within 30%. Over all six: 4/6, 
 33%, serial share 6 points. The two misses are a run that burnt two failed attempts (routes A) and the only
 low-tier review, which has no sonnet-review history to draw on yet (routes C).
 
+**v0.3.8: large-repository gaps.** `worktree_setup` (config commands run in each new task worktree and in
+the integration worktree; failure blocks the task uncharged; whatever they create is never committed or
+cleaned); gate results shared per (tree hash, command) within a run, concurrent identical gates wait for
+the first, async-path gates run off the event loop, `gate_timeout` configurable; planner sees a directory
+digest instead of the file list above 300 files plus AGENTS.md / CONTRIBUTING.md / CLAUDE.md, and may
+WebSearch; network access by kind: spike = WebSearch + WebFetch (and documents sources for downstream),
+plan = WebSearch, every other kind none (explicitly disallowed).
+
 **3. Code dependency graph / change impact: defer.** Its value is in change cycles (invalidate only
 what reads a changed file), but the measured change cycle (watch r2) already re-ran only 2 tasks plus
 the review, and integrate was revalidated by its gates; wall time there was 75% review. Nothing in the

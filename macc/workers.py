@@ -102,11 +102,18 @@ class ClaudeWorker:
                     allowed.append(f"Bash({prefix}:*)")
                     if env:
                         allowed.append(f"Bash({' '.join(env)} {prefix}:*)")
+            if task.kind == "plan":
+                allowed.append("WebSearch")          # specs and APIs the plan depends on; no fetching pages
             cmd += ["--allowedTools", ",".join(dict.fromkeys(allowed))]
+            cmd += ["--disallowedTools", "WebFetch" if task.kind == "plan" else "WebFetch,WebSearch"]
+        elif task.kind == "spike":
+            # only a spike researches online; it writes what it found into its document for downstream
+            cmd += ["--allowedTools", "Read,Edit,Write,MultiEdit,NotebookEdit,Grep,Glob,Bash,WebSearch,WebFetch"]
         else:
             # headless mode denies anything not pre-allowed; workers need the full kit.
             # Ownership is enforced by the PreToolUse guard, not by withholding tools.
-            cmd += ["--allowedTools", "Read,Edit,Write,MultiEdit,NotebookEdit,Grep,Glob,Bash,WebFetch"]
+            cmd += ["--allowedTools", "Read,Edit,Write,MultiEdit,NotebookEdit,Grep,Glob,Bash",
+                    "--disallowedTools", "WebFetch,WebSearch"]
         cmd += self.extra_args
         return cmd
 

@@ -103,7 +103,9 @@ def cmd_run(a) -> int:
     if a.worker == "mock":
         worker = MockWorker()
     else:
-        worker = ClaudeWorker(default_model=a.model, timeout=a.timeout)
+        from .hooks import install as install_hooks
+        settings = None if a.no_guard else install_hooks(repo.macc_dir)
+        worker = ClaudeWorker(default_model=a.model, timeout=a.timeout, settings_file=settings)
         if not worker.available():
             print("claude binary not found on PATH", file=sys.stderr)
             return 2
@@ -208,6 +210,7 @@ def main(argv=None) -> int:
     sp.add_argument("--gate", action="append", help="integration gate command (repeatable)")
     sp.add_argument("--timeout", type=int, default=3600, help="per-worker timeout seconds")
     sp.add_argument("--keep-worktrees", action="store_true")
+    sp.add_argument("--no-guard", action="store_true", help="do not inject the ownership PreToolUse hook")
     sp.set_defaults(fn=cmd_run)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sp = sub.add_parser("change"); sp.add_argument("task"); sp.add_argument("--spec", required=True)

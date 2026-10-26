@@ -55,10 +55,10 @@ async def test_claude_worker_drops_effort_flag_on_old_cli(tmp_path, monkeypatch)
     args_file = tmp_path / "args.txt"
     monkeypatch.setenv("FAKE_ARGS_FILE", str(args_file))
     monkeypatch.setenv("FAKE_REJECT_EFFORT", "1")
-    ClaudeWorker._no_effort_flag = False
+    ClaudeWorker._dropped_flags = set()
     wt = tmp_path / "wt"; wt.mkdir()
     w = ClaudeWorker(binary=str(fake))
     res = await w(Task("x", "x", effort="high"), wt, "p")
     assert res.ok
     assert "--effort" not in args_file.read_text()
-    ClaudeWorker._no_effort_flag = False
+    ClaudeWorker._dropped_flags = set()

@@ -41,12 +41,13 @@ class ClaudeWorker:
 
     def __init__(self, binary: str = "claude", default_model: Optional[str] = None,
                  extra_args: Optional[list[str]] = None, timeout: int = 3600,
-                 permission_mode: str = "acceptEdits"):
+                 permission_mode: str = "acceptEdits", settings_file: Optional[Path] = None):
         self.binary = binary
         self.default_model = default_model
         self.extra_args = extra_args or []
         self.timeout = timeout
         self.permission_mode = permission_mode
+        self.settings_file = settings_file          # hooks (ownership guard) passed via --settings
         self.name = "claude"
 
     def available(self) -> bool:
@@ -59,29 +60,37 @@ class ClaudeWorker:
             cmd += ["--model", model]
         if task.effort:
             cmd += ["--effort", task.effort]
+        if self.settings_file:
+            cmd += ["--settings", str(self.settings_file)]
         if task.kind == "review":
             cmd += ["--allowedTools", "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"]
         cmd += self.extra_args
         return cmd
 
-    _no_effort_flag = False
+    # flags an older CLI may reject; dropped once on "unknown option" and remembered for the process
+    _dropped_flags: set = set()
+    _OPTIONAL_FLAGS = ("--effort", "--settings")
 
     async def __call__(self, task: Task, wt_path: Path, context_pack: str) -> WorkerResult:
         res = await self._invoke(task, wt_path, context_pack)
-        # older CLIs reject --effort; drop it once and retry
-        if not res.ok and res.error and "unknown option" in res.error.lower() and "--effort" in res.error:
-            ClaudeWorker._no_effort_flag = True
-            res = await self._invoke(task, wt_path, context_pack)
+        if not res.ok and res.error and "unknown option" in res.error.lower():
+            for flag in self._OPTIONAL_FLAGS:
+                if flag in res.error and flag not in ClaudeWorker._dropped_flags:
+                    ClaudeWorker._dropped_flags.add(flag)
+                    return await self._invoke(task, wt_path, context_pack)
         return res
 
     async def _invoke(self, task: Task, wt_path: Path, context_pack: str) -> WorkerResult:
         t0 = time.time()
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow nested invocation from inside a Claude session
+        env["MACC_OWNS"] = "|".join(task.owns)
+        env["MACC_TASK"] = task.id
         cmd = self._cmd(task)
-        if ClaudeWorker._no_effort_flag and "--effort" in cmd:
-            i = cmd.index("--effort")
-            del cmd[i:i + 2]
+        for flag in ClaudeWorker._dropped_flags:
+            if flag in cmd:
+                i = cmd.index(flag)
+                del cmd[i:i + 2]
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(wt_path), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

@@ -66,6 +66,7 @@ class Scheduler:
         self.merged_this_run: list[str] = []
         self._merged_since_full_gate = False      # per_task policy: the final full gate is still owed
         self.gate_seconds = 0.0                   # wall time spent in post-merge gates this run
+        self._budget_deferred: set[str] = set()
         self._gated_tree: dict[str, str] = {}     # task -> tree hash its done_when passed on (per_task reuse)
         self.run_seconds: dict[str, float] = {}   # worker seconds per task this run (all attempts, merge agent)
         self.backoff: dict[str, float] = {}      # task -> earliest re-dispatch time (transient failures)
@@ -101,14 +102,21 @@ class Scheduler:
         if self.cfg.token_budget is not None and self.tokens_used + t.est_tokens > self.cfg.token_budget:
             return "budget"
         if self.cfg.cost_budget_usd is not None:
-            # reserve for tasks already running: assume each costs the average of this run so far
-            avg = self.cost_used / self.runs_done if self.runs_done else 0.0
-            if self.cost_used + (len(self.running) + 1) * avg > self.cfg.cost_budget_usd:
+            # reserve for the tasks already running plus this one, each at its kind's historical mean cost
+            # (one expensive opus contract must not make every queued sonnet task look as expensive)
+            reserved = sum(self._est_cost(self.graph.tasks[r]) for r in self.running) + self._est_cost(t)
+            if self.cost_used + reserved > self.cfg.cost_budget_usd:
                 return "budget"
         conflicts = self.graph.conflicts_with_active(t)
         if conflicts:
             return f"ownership_conflict:{','.join(conflicts)}"
         return None
+
+    def _est_cost(self, t: Task) -> float:
+        by_kind = self.store.avg_cost_by_kind()
+        if t.kind in by_kind:
+            return by_kind[t.kind]
+        return self.cost_used / self.runs_done if self.runs_done else 0.0
 
     def _dispatch_ready(self) -> int:
         n = 0
@@ -127,10 +135,17 @@ class Scheduler:
                 continue
             why = self._can_dispatch(t)
             if why:
-                if why == "budget" and self.stopped_reason is None:
-                    self.stopped_reason = "budget_exceeded"
-                    self.emit("budget_exceeded", t.id, tokens=self.tokens_used, cost_usd=round(self.cost_used, 2),
-                              token_budget=self.cfg.token_budget, cost_budget_usd=self.cfg.cost_budget_usd)
+                if why == "budget":
+                    payload = dict(tokens=self.tokens_used, cost_usd=round(self.cost_used, 2),
+                                   token_budget=self.cfg.token_budget, cost_budget_usd=self.cfg.cost_budget_usd)
+                    if self.running:
+                        # only the reservation for running tasks is in the way: it may fit once they report
+                        if t.id not in self._budget_deferred:
+                            self._budget_deferred.add(t.id)
+                            self.emit("budget_deferred", t.id, running=sorted(self.running), **payload)
+                    elif self.stopped_reason is None:
+                        self.stopped_reason = "budget_exceeded"
+                        self.emit("budget_exceeded", t.id, **payload)
                 continue
             self._start(t)
             n += 1

@@ -642,3 +642,54 @@ async def test_per_task_reruns_gate_when_base_moved(repo, tmp_path):
     s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2, integration_gates=["true"])
     assert summary["finished"] and ("gate_reused", "t") not in events
     assert runs.read_text().count("run") == 2            # worktree, then again on the moved integration tree
+
+
+async def test_budget_reservation_uses_cost_by_kind_and_defers_without_stopping(repo):
+    class PricedWorker(MockWorker):
+        async def __call__(self, task, wt_path, context_pack):
+            res = await super().__call__(task, wt_path, context_pack)
+            res.cost_usd = 1.8 if task.kind == "contract" else 0.2
+            return res
+
+    store = Store(repo.macc_dir / "state.db")
+    tasks = [Task("c", "c", kind=Kind.CONTRACT.value, owns=["api/**"])] + \
+            [Task(f"m{i}", f"m{i}", deps=["c"], owns=[f"m{i}/**"], spec="mock:sleep=0.1") for i in range(6)]
+    g = TaskGraph(tasks); g.validate()
+    for i in range(3):                                      # history: code runs cost ~$0.2
+        store.add_usage(f"old{i}", 1, "claude", True, cost_usd=0.2, model="m", kind="code")
+    store.add_usage("oldc", 1, "claude", True, cost_usd=1.8, model="m", kind="contract")
+    events = []
+    s = Scheduler(repo, store, g, PricedWorker(),
+                  SchedulerConfig(max_parallel=6, cost_budget_usd=4.0, cost_baseline_usd=2.4),
+                  on_event=lambda t, tid, p: events.append((t, tid)))
+    summary = await s.run()
+    # 1.8 spent after the contract; 6 code tasks at ~0.2 each fit in 4.0 with the per-kind estimate
+    # (the old run-average estimate reserved 1.8 per task and held most of them back)
+    first_wave = [tid for t, tid in events if t == "dispatched"][1:7]
+    assert len(first_wave) == 6
+    assert summary["finished"] and summary["stopped_reason"] is None
+    assert not [e for e in events if e[0] == "budget_exceeded"]
+
+
+async def test_budget_deferral_is_not_a_stop_until_nothing_runs(repo):
+    class PricedWorker(MockWorker):
+        async def __call__(self, task, wt_path, context_pack):
+            res = await super().__call__(task, wt_path, context_pack)
+            res.cost_usd = 1.0
+            return res
+
+    store = Store(repo.macc_dir / "state.db")
+    tasks = [Task(f"t{i}", f"t{i}", owns=[f"t{i}/**"], spec="mock:sleep=0.1") for i in range(4)]
+    g = TaskGraph(tasks); g.validate()
+    store.add_usage("old", 1, "claude", True, cost_usd=1.0, model="m", kind="code")
+    store.add_usage("old2", 1, "claude", True, cost_usd=1.0, model="m", kind="code")
+    store.add_usage("old3", 1, "claude", True, cost_usd=1.0, model="m", kind="code")
+    events = []
+    s = Scheduler(repo, store, g, PricedWorker(),
+                  SchedulerConfig(max_parallel=4, cost_budget_usd=2.5, cost_baseline_usd=3.0),
+                  on_event=lambda t, tid, p: events.append((t, tid)))
+    summary = await s.run()
+    types = [t for t, _ in events]
+    assert "budget_deferred" in types                      # 3rd task waited while two were running
+    assert summary["stopped_reason"] == "budget_exceeded"  # then the money really ran out
+    assert summary["states"].get("done") == 2

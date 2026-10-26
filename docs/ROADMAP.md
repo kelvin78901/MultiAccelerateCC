@@ -29,6 +29,10 @@ Graph, store, worktrees, handoffs, scheduler, CLI, mock worker, 32 tests.
       `usage` (>= 3 samples; `usage.kind` added and backfilled); run summary and `status` show this run's
       critical path, actual vs estimate. Fix: a `REOPEN:` naming a non-direct ancestor now holds the tasks
       in between as STALE, so the review waits for the redo (it used to re-review the unchanged tree).
+- [x] v0.2.10/11: plan reload ignores finished tasks in the contract-ordering rule (a second feature
+      plan could not load); cost reservations use the per-kind historical mean instead of this run's
+      average (one $1.81 opus contract made each queued $0.2 sonnet task look like $1.81), and a
+      reservation that only waits for running tasks is `budget_deferred`, not a sticky `budget_exceeded`.
 
 ### Real-run data (2026-10-26; input for the v0.3 cost model)
 Source: `usage` and `events` in `~/macc-smoke/.macc/state.db` and `AutoLeaseRank/.macc/state.db`.
@@ -74,6 +78,13 @@ What this says:
   the worktree gate. Fixed in the same release by reusing the gate when the tree is unchanged; with it,
   run B costs the same as full. Rule of thumb: per_task saves (merges − 1) × full-suite time when task
   gates are cheap; it buys nothing for a task whose own gate is the full suite.
+- **Fan-out run** (AutoLeaseRank `/insights`, 12 tasks: contract → 4 independent modules + 4 test tasks
+  (merge_after) → api → integrate → review; `--parallel 6`, per_task gates): $5.65 run + $1.35 planner,
+  1683 s wall, worker sum 1934 s → **1.15x overall**. The contract alone took 1350 s / 41.8k output
+  tokens / $1.81 (it pre-computed every module's expected output on the fixtures). After the contract:
+  584 s of work in 333 s wall = **1.75x** (ceiling 1.92 against that phase's critical path). Fan-out
+  works; one oversized serial node erases it. Contract scope is the cost model's biggest lever.
+  Gates: 4 s total (suite 1.4 s; three `gate_reused`).
 - Reliability: 32 worker runs, 1 transient CLI failure (stdin race, fixed in v0.2.2), 1 gate failure
   from tests merged before their implementation (fixed by `merge_after`), 1 out-of-scope commit
   caught by review (fixed by scoped commits), 1 REJECT → reopen → APPROVE.

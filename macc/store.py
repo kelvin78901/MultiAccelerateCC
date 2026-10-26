@@ -284,6 +284,12 @@ class Store:
             r["est_tasks"] = e["tasks"] if e else 0
         return out
 
+    def avg_cost_by_kind(self) -> dict[str, float]:
+        """Mean reported cost per worker run, by task kind (budget reservations)."""
+        return {r["kind"]: r["c"] for r in self._conn.execute(
+            "SELECT kind, AVG(cost_usd) c FROM usage WHERE kind IS NOT NULL AND kind != 'plan' "
+            "AND model IS NOT NULL GROUP BY kind")}
+
     def history_by_kind(self, min_samples: int = 3) -> dict[str, dict]:
         """Planner calibration: per kind, median worker seconds per run (runs whose CLI started) and median
         actual/est per task. A statistic is omitted when it has fewer than `min_samples` samples."""

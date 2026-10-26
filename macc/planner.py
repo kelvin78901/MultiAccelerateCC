@@ -38,7 +38,10 @@ Inspect the repository (read-only) as needed before planning.
 6. Keep tasks between 10 and 60 estimated minutes; split bigger ones. 4 to 12 tasks total.
 7. effort: contract/integrate/review `high`; ordinary code `medium`; trivial `low`.
 8. est_tokens is total tokens for the task (typical: contract 40k, code 60k-150k, review 50k).
-9. Model per task: `model: sonnet` for ordinary code and tests; `model: opus` only for contract,
+9. Tests in parallel, merged in order: a test task may run at the same time as the implementation it
+   tests, but must list that implementation task under `merge_after` (NOT `deps`) so its tests are
+   merged only once the implementation is in. Otherwise the integration gate fails on the old code.
+10. Model per task: `model: sonnet` for ordinary code and tests; `model: opus` only for contract,
    integrate and review. Put `model: sonnet` in defaults.
 
 # Output
@@ -57,6 +60,7 @@ tasks:
     title: <short>
     kind: contract|code|spike|integrate|review
     deps: [<ids>]
+    merge_after: [<ids>]      # optional; see rule 9
     owns: ["<glob>", ...]
     effort: low|medium|high
     est_minutes: <int>

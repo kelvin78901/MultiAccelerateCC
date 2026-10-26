@@ -52,6 +52,7 @@ class Task:
     title: str
     spec: str = ""
     deps: list[str] = field(default_factory=list)
+    merge_after: list[str] = field(default_factory=list)  # soft order: run in parallel, merge after these are DONE
     owns: list[str] = field(default_factory=list)       # path globs this task may write
     kind: str = Kind.CODE.value
     effort: str = "medium"                              # low|medium|high|xhigh|max
@@ -112,7 +113,30 @@ class TaskGraph:
             for d in t.deps:
                 if d not in self.tasks:
                     raise GraphError(f"{t.id} depends on unknown task {d}")
+            for d in t.merge_after:
+                if d not in self.tasks:
+                    raise GraphError(f"{t.id} merge_after unknown task {d}")
+                if d in t.deps:
+                    raise GraphError(f"{t.id}: {d} is already a hard dep; merge_after is redundant")
         self.topo_order()  # raises on cycle
+        # deps + merge_after together must also be acyclic (merge order is a DAG too)
+        combined = {k: set(t.deps) | set(t.merge_after) for k, t in self.tasks.items()}
+        seen: set[str] = set()
+        stack: set[str] = set()
+
+        def visit(n: str) -> None:
+            if n in stack:
+                raise GraphError(f"cycle through deps/merge_after at {n}")
+            if n in seen:
+                return
+            stack.add(n)
+            for m in combined[n]:
+                visit(m)
+            stack.discard(n)
+            seen.add(n)
+
+        for k in self.tasks:
+            visit(k)
         # a CONTRACT task must precede (be a dep of) everything that shares its ownership
         for t in self.tasks.values():
             if t.kind == Kind.CONTRACT.value:

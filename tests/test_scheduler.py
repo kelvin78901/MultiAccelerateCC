@@ -337,3 +337,45 @@ async def test_transient_failure_not_charged(repo):
     s, store, g, worker, events, summary = await run(repo, tasks)
     assert g.tasks["t"].state == State.DONE.value and g.tasks["t"].attempts == 1
     assert ("transient_failure", "t") in events and worker.calls.count("t") == 2
+
+
+async def test_merge_after_runs_parallel_but_merges_in_order(repo):
+    """tests run concurrently with impl, but merge only after impl is in; the integration gate
+    (which needs impl's file) therefore never fails on the old code."""
+    tasks = [
+        Task("contract", "c", kind=Kind.CONTRACT.value, owns=["api/**"], est_minutes=1),
+        Task("impl", "impl", deps=["contract"], owns=["src/**"], spec="mock:sleep=0.4", est_minutes=10),
+        Task("tests", "tests", deps=["contract"], merge_after=["impl"], owns=["tests/**"],
+             spec="mock:sleep=0.05", est_minutes=5),
+    ]
+    s, store, g, worker, events, summary = await run(
+        repo, tasks, max_parallel=3, integration_gates=["test ! -f tests/tests.txt || test -f src/impl.txt"])
+    assert summary["finished"], summary
+    seq = [(e, tid) for e, tid in events if e in ("dispatched", "awaiting_merge", "done")]
+    assert seq.index(("dispatched", "tests")) < seq.index(("done", "impl"))       # ran in parallel
+    assert ("awaiting_merge", "tests") in events
+    assert seq.index(("done", "impl")) < seq.index(("done", "tests"))             # merged in order
+    assert "integration_gate_failed" not in [e for e, _ in events]
+    assert not repo.task_path("tests").exists()
+
+
+async def test_merge_after_target_failure_blocks_parked(repo):
+    tasks = [
+        Task("impl", "impl", owns=["src/**"], spec="mock:fail_first", max_attempts=1),
+        Task("tests", "tests", merge_after=["impl"], owns=["tests/**"]),
+    ]
+    s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)
+    assert g.tasks["impl"].state == State.FAILED.value
+    assert g.tasks["tests"].state == State.BLOCKED.value
+    assert ("merge_blocked", "tests") in events
+
+
+def test_merge_after_validation():
+    g = TaskGraph([Task("a", "a", merge_after=["b"]), Task("b", "b", deps=["a"])])
+    import pytest as _pt
+    from macc.graph import GraphError
+    with _pt.raises(GraphError, match="cycle"):
+        g.validate()
+    g2 = TaskGraph([Task("a", "a"), Task("b", "b", deps=["a"], merge_after=["a"])])
+    with _pt.raises(GraphError, match="redundant"):
+        g2.validate()

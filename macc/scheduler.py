@@ -51,6 +51,7 @@ class Scheduler:
         self.cfg = config or SchedulerConfig()
         self._on_event = on_event
         self.running: dict[str, asyncio.Task] = {}
+        self.parked: dict[str, dict] = {}        # finished workers waiting for merge_after targets
         self.tokens_used = 0
         self.cost_used = 0.0
         self.runs_done = 0
@@ -211,6 +212,49 @@ class Scheduler:
             self._cleanup(tid)
             return
 
+        # 3b. soft ordering: `merge_after` tasks must be DONE before this one is merged.
+        #     The task ran in parallel; only its merge waits (e.g. tests merge after the implementation).
+        if committed and not self._merge_after_satisfied(t):
+            t.state = State.REVIEW.value          # keeps ownership reserved and the worktree alive
+            self.parked[tid] = dict(wt=wt, res=res, gates=gates, handoff=handoff, out_hash=out_hash)
+            self._persist(tid)
+            self.emit("awaiting_merge", tid, after=[d for d in t.merge_after
+                                                     if self.graph.tasks[d].state != State.DONE.value])
+            return
+        await self._merge_and_finish(t, wt, res, gates, handoff, out_hash, committed)
+
+    def _merge_after_satisfied(self, t: Task) -> bool:
+        return all(self.graph.tasks[d].state == State.DONE.value for d in t.merge_after if d in self.graph.tasks)
+
+    async def _try_parked(self) -> None:
+        for tid in list(self.parked):
+            t = self.graph.tasks[tid]
+            if t.preempt:                           # inputs changed while parked: redo
+                p = self.parked.pop(tid)
+                t.attempts = max(0, t.attempts - 1)
+                t.state = State.PENDING.value
+                t.preempt = False
+                self._persist(tid)
+                self.emit("preempted", tid, reason="inputs changed while awaiting merge")
+                self._cleanup(tid)
+                continue
+            if self._merge_after_satisfied(t):
+                p = self.parked.pop(tid)
+                # the base moved: refresh facts after rebase inside _merge_and_finish
+                await self._merge_and_finish(t, p["wt"], p["res"], p["gates"], p["handoff"], p["out_hash"], True)
+            elif not self.running and all(self.graph.tasks[d].state in (State.FAILED.value, State.BLOCKED.value,
+                                                                           State.CANCELLED.value)
+                                          for d in t.merge_after if self.graph.tasks[d].state != State.DONE.value):
+                self.parked.pop(tid)
+                t.state = State.BLOCKED.value
+                t.last_error = f"merge_after targets failed: {t.merge_after}"
+                self._persist(tid)
+                self.emit("merge_blocked", tid, after=t.merge_after)
+                self._cleanup(tid)
+
+    async def _merge_and_finish(self, t: Task, wt: Path, res: WorkerResult, gates: list[dict],
+                                handoff: dict, out_hash: str, committed: bool) -> None:
+        tid = t.id
         # 4. rebase + merge (topological order is implied: deps are DONE, i.e. already merged)
         if committed:
             rb = self.repo.rebase_task_on_integration(tid)
@@ -222,6 +266,10 @@ class Scheduler:
                     self._cleanup(tid)
                     return
                 # the merge agent changed the tree: regenerate facts
+                base = self.repo.merge_base(wt)
+                handoff = generate_handoff(self.repo, t, wt, gates, res.fields, base)
+                out_hash = self.repo.output_hash(wt, base)
+            if rb.ok:
                 base = self.repo.merge_base(wt)
                 handoff = generate_handoff(self.repo, t, wt, gates, res.fields, base)
                 out_hash = self.repo.output_hash(wt, base)
@@ -370,12 +418,17 @@ class Scheduler:
         while True:
             self._revalidate_stale()
             self._dispatch_ready()
+            await self._try_parked()
             if not self.running:
-                break
+                if self.parked:
+                    await self._try_parked()      # may block parked tasks whose targets failed
+                if not self.running:
+                    break
             done, _ = await asyncio.wait(set(self.running.values()), return_when=asyncio.FIRST_COMPLETED)
             for fut in done:
                 tid, wt, res = fut.result()
                 await self._on_finished(tid, wt, res)
+            await self._try_parked()
         summary = {
             "states": self.graph.summary(),
             "finished": self.graph.is_finished(),

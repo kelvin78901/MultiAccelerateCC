@@ -22,7 +22,7 @@ def load_plan(path: str | Path) -> tuple[TaskGraph, dict]:
 
 
 def dump_plan(g: TaskGraph, path: str | Path) -> None:
-    keep = ["id", "title", "spec", "deps", "owns", "kind", "effort", "model", "est_tokens",
+    keep = ["id", "title", "spec", "deps", "merge_after", "owns", "kind", "effort", "model", "est_tokens",
             "est_minutes", "done_when", "allow_stubs", "max_attempts"]
     tasks = [{k: v for k, v in t.to_dict().items() if k in keep and v not in (None, [], "", False)}
              for t in (g.tasks[i] for i in g.topo_order())]

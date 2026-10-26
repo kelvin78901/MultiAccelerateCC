@@ -52,7 +52,18 @@ def cmd_init(a) -> int:
     rules = repo.macc_dir / "rules.md"
     if not rules.exists():
         rules.write_text("# Project rules for macc workers\n\n- Keep this file short. Only things a model would guess wrong.\n")
-    print(f"initialised {repo.macc_dir} (integration branch + state db)")
+    cfgp = repo.macc_dir / "config.json"
+    cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
+    if a.gate:
+        cfg["integration_gates"] = a.gate
+        res = repo.run_gates(a.gate)
+        bad = [r for r in res if not r["ok"]]
+        if bad:
+            print(f"WARNING: gate fails on the current integration tree: {bad[0]['cmd']!r}\n{bad[0]['stderr'][-600:]}{bad[0]['stdout'][-600:]}")
+        else:
+            print(f"gate verified on integration tree: {a.gate}")
+    cfgp.write_text(json.dumps(cfg, indent=2))
+    print(f"initialised {repo.macc_dir} (integration branch + state db); gates={cfg.get('integration_gates', [])}")
     return 0
 
 
@@ -281,7 +292,9 @@ def main(argv=None) -> int:
     p.add_argument("--repo", default=".", help="target git repository (default: cwd)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init").set_defaults(fn=cmd_init)
+    sp = sub.add_parser("init"); sp.add_argument("--gate", action="append", default=None,
+                                                 help="integration gate command (repeatable); recorded in config.json and seen by the planner")
+    sp.set_defaults(fn=cmd_init)
     sp = sub.add_parser("plan"); sp.add_argument("plan", nargs="?", default=None)
     sp.add_argument("--from", dest="from_desc", default=None, help="feature description -> generate PLAN.yaml with one planner call")
     sp.add_argument("--worker", choices=["claude", "mock"], default="claude")

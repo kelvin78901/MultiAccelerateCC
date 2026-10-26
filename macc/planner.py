@@ -134,7 +134,7 @@ def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: l
                 warns.append(f"{t.id}: done_when uses a bare python interpreter (not a pure-stdlib -c/-m py_compile use): {cmd!r}")
             if "%%" in cmd:
                 warns.append(f"{t.id}: done_when contains '%%' (no formatting is applied; probably a bug): {cmd!r}")
-        if existing_files:
+        if existing_files and t.kind != Kind.INTEGRATE.value:   # integrate owning everything is by design
             for g_ in t.owns:
                 hits = sorted(f for f in existing_files if _glob_hit(f, g_))
                 if hits and not MODIFY_WORDS.search(t.spec):

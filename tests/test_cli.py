@@ -84,3 +84,12 @@ def test_change_owns_and_done_when(repo_dir, tmp_path, capsys):
     from macc.store import Store
     g = Store(repo_dir / ".macc" / "state.db").load_graph()
     assert g.tasks["t"].owns == ["b/**", "c.py"] and g.tasks["t"].state == "pending"
+
+
+def test_init_records_gate(repo_dir, capsys):
+    r = str(repo_dir)
+    assert main(["--repo", r, "init", "--gate", "true", "--gate", "test -f README.md"]) == 0
+    import json
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["integration_gates"] == ["true", "test -f README.md"]
+    assert "gate verified" in capsys.readouterr().out

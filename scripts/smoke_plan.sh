@@ -8,7 +8,7 @@ TARGET="${TARGET:-$HOME/macc-smoke}"
 MACC="$HERE/.venv/bin/python -m macc.cli"
 [ -d "$TARGET/.git" ] || { echo "run scripts/smoke.sh first"; exit 2; }
 cd "$TARGET"
-$MACC plan --from "Add a `stats` module to calc with mean/median/stdev, a CLI entry point (python -m calc), and tests for both. Keep stdlib only." --effort medium plan2.yaml
+$MACC plan --from 'Add a stats module to calc with mean/median/stdev, a CLI entry point (python -m calc), and tests for both. Keep stdlib only.' --effort medium plan2.yaml
 if [ "${1:-}" = "--run" ]; then
   $MACC plan plan2.yaml
   time $MACC run --worker claude --parallel 3 || true

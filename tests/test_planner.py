@@ -26,8 +26,9 @@ def test_extract_yaml_variants():
 
 async def test_generate_plan_retries_once_on_invalid(tmp_path):
     out = tmp_path / "plan.yaml"
-    g = await generate_plan("build a todo app mock:bad_plan_first", tmp_path, MockWorker(), out)
-    assert out.exists() and len(g.tasks) == 5
+    pr = await generate_plan("build a todo app mock:bad_plan_first", tmp_path, MockWorker(), out)
+    g = pr.graph
+    assert out.exists() and len(g.tasks) == 5 and len(pr.usage) == 2
     data = yaml.safe_load(out.read_text())
     assert data["tasks"][2]["owns"] == ["web/**"]          # the corrected plan
 
@@ -35,7 +36,23 @@ async def test_generate_plan_retries_once_on_invalid(tmp_path):
 def test_cli_plan_from(tmp_path, capsys):
     import subprocess
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(tmp_path), "config", k, v], check=True)
+    (tmp_path / "README.md").write_text("x\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True)
     rc = main(["--repo", str(tmp_path), "plan", "--from", "todo app", "--worker", "mock", str(tmp_path / "p.yaml")])
     out = capsys.readouterr().out
     assert rc == 0 and "wrote" in out and "graph TD" in out
     assert main(["--repo", str(tmp_path), "plan", str(tmp_path / "p.yaml")]) == 0
+
+
+def test_plan_warnings():
+    from macc.planner import plan_warnings
+    g = validate_plan(yaml.safe_load(MOCK_PLAN))
+    g.tasks["backend"].done_when = ["python3 -c 'x=1'", "curl 'http://x/%%20'"]
+    w = plan_warnings(g, existing_files={"server/app.py", "api/openapi.yaml"}, gates=["python -m pytest"])
+    joined = "\n".join(w)
+    assert "bare python" in joined and "%%" in joined
+    assert "backend: owns 'server/**' which already contains ['server/app.py']" in joined
+    assert "contract: owns" not in joined          # api/openapi.yaml exists but the spec names it -> fine

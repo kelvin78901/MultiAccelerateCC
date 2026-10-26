@@ -54,6 +54,7 @@ class Scheduler:
         self._on_event = on_event
         self.running: dict[str, asyncio.Task] = {}
         self.parked: dict[str, dict] = {}        # finished workers waiting for merge_after targets
+        self.backoff: dict[str, float] = {}      # task -> earliest re-dispatch time (transient failures)
         self.tokens_used = 0
         # budget is cumulative over runs of the same plan: start from what was already spent since plan load
         self.cost_used = max(0.0, store.usage_totals()["cost_usd"] - self.cfg.cost_baseline_usd)
@@ -94,9 +95,13 @@ class Scheduler:
 
     def _dispatch_ready(self) -> int:
         n = 0
+        now = time.time()
         for t in self.graph.ready():
             if t.id in self.running:
                 continue
+            if self.backoff.get(t.id, 0) > now:
+                continue
+            self.backoff.pop(t.id, None)
             if t.kind == Kind.MANUAL.value:
                 if t.state != State.BLOCKED.value:
                     t.state = State.BLOCKED.value
@@ -174,7 +179,7 @@ class Scheduler:
                 t.state = State.PENDING.value
                 self._persist(tid)
                 self.emit("transient_failure", tid, count=t.transients, error=(res.error or "")[:300])
-                await asyncio.sleep(min(30.0, 2.0 ** t.transients))   # back off before re-dispatch
+                self.backoff[tid] = time.time() + min(30.0, 2.0 ** t.transients)   # non-blocking back-off
             self._cleanup(tid)
             return
         if not res.ok:
@@ -449,6 +454,11 @@ class Scheduler:
             if not self.running:
                 if self.parked:
                     await self._try_parked()      # may block parked tasks whose targets failed
+                pending_backoff = [v for k, v in self.backoff.items()
+                                   if self.graph.tasks[k].state in (State.PENDING.value, State.READY.value)]
+                if not self.running and pending_backoff:
+                    await asyncio.sleep(max(0.0, min(pending_backoff) - time.time()))
+                    continue
                 if not self.running:
                     break
             done, _ = await asyncio.wait(set(self.running.values()), return_when=asyncio.FIRST_COMPLETED)

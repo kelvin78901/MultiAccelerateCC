@@ -7,6 +7,7 @@ ownership overlap between tasks that could run concurrently) and the human revie
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -71,6 +72,19 @@ tasks:
       <precise instructions for a worker that has no other context>
 {END}
 
+# Repository state (the integration branch, where workers run; NOT necessarily what `main` shows)
+Files currently present:
+{FILES}
+
+Existing integration gate (reuse it unless there is a reason not to): {GATE}
+Rules for commands in `done_when` / `integration_gates`:
+- They run via the shell with no templating: write them literally (no `%%`, no `$VAR` you did not set).
+- Never use a bare `python`/`python3`: it is whatever is first on the operator's PATH. Use the same
+  interpreter the existing gate uses, or `python3 -c` only for pure-stdlib checks that need no packages.
+- A task that replaces or extends an existing file must say so explicitly in its spec, name the file,
+  and own it. Do not assume an empty repository.
+- If a check must verify "stdlib only", test against `sys.stdlib_module_names`, never a hand-written list.
+
 # Feature to plan
 {DESCRIPTION}
 """
@@ -88,6 +102,37 @@ def extract_yaml(text: str) -> str:
     if m:
         return m.group(1).strip()
     raise PlanError("no plan block found in planner output")
+
+
+BARE_PY = re.compile(r"(?:^|[\s;&|(])python3?(?:\s|$)")
+
+
+def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: list[str] | None = None) -> list[str]:
+    """Non-fatal problems a human should see before running."""
+    warns: list[str] = []
+    for cmd in list(gates or []):
+        if BARE_PY.search(cmd):
+            warns.append(f"integration gate uses a bare python interpreter: {cmd!r}")
+    for t in g.tasks.values():
+        for cmd in t.done_when:
+            if BARE_PY.search(cmd):
+                warns.append(f"{t.id}: done_when uses a bare python interpreter: {cmd!r}")
+            if "%%" in cmd:
+                warns.append(f"{t.id}: done_when contains '%%' (no formatting is applied; probably a bug): {cmd!r}")
+        if existing_files:
+            for g_ in t.owns:
+                hits = sorted(f for f in existing_files if _glob_hit(f, g_))
+                if hits and not any(h in t.spec for h in hits) and not any(Path(h).name in t.spec for h in hits):
+                    warns.append(f"{t.id}: owns {g_!r} which already contains {hits[:3]} but the spec never mentions them")
+    return warns
+
+
+def _glob_hit(path: str, glob: str) -> bool:
+    import fnmatch
+    if fnmatch.fnmatch(path, glob):
+        return True
+    d = glob.rstrip("/*")
+    return bool(d) and (path == d or path.startswith(d + "/"))
 
 
 def validate_plan(data: dict) -> TaskGraph:
@@ -117,15 +162,35 @@ def validate_plan(data: dict) -> TaskGraph:
     return g
 
 
-async def generate_plan(description: str, repo_root: Path, worker: WorkerFn, out: Path,
-                        effort: str = "high", model: Optional[str] = None, max_rounds: int = 2) -> TaskGraph:
-    """Call the planner worker; on validation failure feed the error back once."""
-    prompt = PLANNER_PROMPT.replace("{BEGIN}", PLAN_BEGIN).replace("{END}", PLAN_END).replace("{DESCRIPTION}", description)
+@dataclass
+class PlanResult:
+    graph: TaskGraph
+    warnings: list[str]
+    config: dict
+    usage: list                      # WorkerResult per round
+
+
+async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: Path,
+                        effort: str = "high", model: Optional[str] = None, max_rounds: int = 2,
+                        existing_files: Optional[list[str]] = None, current_gate: str = "") -> PlanResult:
+    """Call the planner worker inside `workdir` (the integration worktree, where workers will run);
+    on validation failure feed the error back once. Returns the graph plus non-fatal warnings."""
+    files = existing_files if existing_files is not None else sorted(
+        str(p.relative_to(workdir)) for p in workdir.rglob("*")
+        if p.is_file() and ".git" not in p.parts and ".macc" not in p.parts)
+    listing = "\n".join(f"- {f}" for f in files[:300]) or "- (empty)"
+    if len(files) > 300:
+        listing += f"\n- ... {len(files) - 300} more"
+    prompt = (PLANNER_PROMPT.replace("{BEGIN}", PLAN_BEGIN).replace("{END}", PLAN_END)
+              .replace("{DESCRIPTION}", description).replace("{FILES}", listing)
+              .replace("{GATE}", current_gate or "(none configured)"))
     task = Task(id="_plan", title="plan", kind="plan", effort=effort, model=model, owns=[])
     last_err = ""
+    usage = []
     for _ in range(max_rounds):
         p = prompt + (f"\n\n# Your previous plan was rejected\n{last_err}\nFix it and emit the full plan again.\n" if last_err else "")
-        res = await worker(task, repo_root, p)
+        res = await worker(task, workdir, p)
+        usage.append(res)
         if not res.ok:
             raise PlanError(f"planner call failed: {res.error}")
         try:
@@ -136,5 +201,7 @@ async def generate_plan(description: str, repo_root: Path, worker: WorkerFn, out
             last_err = str(e)
             continue
         out.write_text(text + "\n")
-        return g
+        cfg = (data.get("config") or {}) if isinstance(data, dict) else {}
+        warns = plan_warnings(g, set(files), cfg.get("integration_gates"))
+        return PlanResult(graph=g, warnings=warns, config=cfg, usage=usage)
     raise PlanError(f"planner could not produce a valid plan: {last_err}")

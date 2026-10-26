@@ -68,11 +68,35 @@ def cmd_plan(a) -> int:
             if not worker.available():
                 print("claude binary not found on PATH", file=sys.stderr)
                 return 2
-        g = asyncio.run(generate_plan(a.from_desc, repo.root, worker, out, effort=a.effort, model=a.model))
-        print(f"wrote {out} ({len(g.tasks)} tasks). Review it, then: macc plan {out}")
+        # plan against the integration branch: that is the tree workers will fork from
+        ipath = repo.ensure_integration()
+        existing = repo.git("ls-files", cwd=ipath).stdout.split()
+        cfg_now = json.loads((repo.macc_dir / "config.json").read_text()) if (repo.macc_dir / "config.json").exists() else {}
+        gate_now = " && ".join(cfg_now.get("integration_gates", []))
+        pr = asyncio.run(generate_plan(a.from_desc, ipath, worker, out, effort=a.effort, model=a.model,
+                                       existing_files=existing, current_gate=gate_now))
+        g = pr.graph
+        for i, u in enumerate(pr.usage, 1):
+            store.add_usage("_plan", i, getattr(worker, "name", "worker"), u.ok, model=u.model,
+                            input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+                            cache_read_tokens=u.cache_read_tokens, cost_usd=u.cost_usd, seconds=u.seconds)
+        store.event("plan_generated", None, out=str(out), tasks=len(g.tasks), rounds=len(pr.usage),
+                    cost_usd=round(sum(u.cost_usd for u in pr.usage), 4))
+        print(f"wrote {out} ({len(g.tasks)} tasks, {len(pr.usage)} planner round(s), "
+              f"${sum(u.cost_usd for u in pr.usage):.2f}). Review it, then: macc plan {out}")
         for tid in g.topo_order():
             t = g.tasks[tid]
-            print(f"  {t.kind:<9} {t.id:<24} deps={t.deps} owns={t.owns} ~{t.est_minutes:.0f}min")
+            print(f"  {t.kind:<9} {t.id:<24} deps={t.deps} merge_after={t.merge_after} owns={t.owns} ~{t.est_minutes:.0f}min")
+        if pr.config.get("integration_gates"):
+            res = repo.run_gates(pr.config["integration_gates"])
+            bad = [r for r in res if not r["ok"]]
+            if bad:
+                pr.warnings.append(f"proposed integration gate FAILS on the current integration tree: {bad[0]['cmd']!r} "
+                                   f"-> every task would be BLOCKED (gate_broken_baseline)")
+        if pr.warnings:
+            print("\nWARNINGS (fix before `macc plan`):")
+            for w in pr.warnings:
+                print(f"  - {w}")
         print("\n" + g.to_mermaid())
         return 0
     if not a.plan:

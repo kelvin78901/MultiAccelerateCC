@@ -1,0 +1,5 @@
+config:
+  max_parallel: 2
+  token_budget: 150000
+  integration_gates: ["bash .macc/gate.sh"]''')
+open(p,'w').write(s)

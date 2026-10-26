@@ -203,3 +203,16 @@ async def test_manual_task_blocks(repo):
     s, store, g, worker, events, summary = await run(repo, tasks)
     assert g.tasks["m"].state == State.BLOCKED.value and summary["blocked"] == ["m"]
     assert worker.calls == []
+
+
+async def test_broken_baseline_gate_blocks_without_charging_attempt(repo):
+    """If the integration gate fails on the baseline too, it is an environment problem:
+    task -> BLOCKED, attempt not charged, merge reverted."""
+    tasks = [Task("t", "t", owns=["x/**"], max_attempts=2)]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["false"])
+    t = g.tasks["t"]
+    assert t.state == State.BLOCKED.value and t.attempts == 0
+    assert ("gate_broken_baseline", "t") in events and ("retry", "t") not in events
+    assert worker.calls == ["t"]                      # exactly one worker run, no retry loop
+    assert not (repo.integration_path / "x" / "t.txt").exists()
+    assert "baseline" in t.last_error

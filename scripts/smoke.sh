@@ -29,11 +29,16 @@ Python 3 project. Keep files tiny. Standard library only. Never add dependencies
 EOF
 git add -A && git commit -q -m init
 
+mkdir -p .macc
+# integration gate: pytest from the macc venv; "no tests collected" (rc 5) is fine on an empty repo
+printf '#!/usr/bin/env bash\n"%s/.venv/bin/python" -m pytest -q; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 5 ]\n' "$HERE" > .macc/gate.sh
+chmod +x .macc/gate.sh
+
 cat > plan.yaml <<'EOF'
 config:
   max_parallel: 2
   token_budget: 150000
-  integration_gates: ["python3 -m pytest -q"]
+  integration_gates: ["bash .macc/gate.sh"]
 defaults:
   effort: low
   max_attempts: 2

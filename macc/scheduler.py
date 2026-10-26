@@ -198,6 +198,17 @@ class Scheduler:
             if igates and not all(g["ok"] for g in igates):
                 self.repo.git("reset", "--hard", before, cwd=self.repo.integration_path)
                 bad = next(g for g in igates if not g["ok"])
+                # Was the baseline already broken? Then this is an environment problem, not the task's.
+                baseline = self.repo.run_gates([bad["cmd"]])
+                if not baseline[0]["ok"]:
+                    t.attempts = max(0, t.attempts - 1)       # do not charge the attempt
+                    t.state = State.BLOCKED.value
+                    t.last_error = (f"integration gate '{bad['cmd']}' fails on the baseline too; fix the "
+                                    f"environment and `macc retry {tid}`\n{bad['stderr'][-800:]}{bad['stdout'][-800:]}")
+                    self._persist(tid)
+                    self.emit("gate_broken_baseline", tid, cmd=bad["cmd"])
+                    self._cleanup(tid)
+                    return
                 self.emit("integration_gate_failed", tid, cmd=bad["cmd"])
                 self._fail(t, f"integration gate failed after merge: {bad['cmd']}\n{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
                 self._cleanup(tid)

@@ -91,6 +91,12 @@ What this says:
   584 s of work in 333 s wall = **1.75x** (ceiling 1.92 against that phase's critical path). Fan-out
   works; one oversized serial node erases it. Contract scope is the cost model's biggest lever.
   Gates: 4 s total (suite 1.4 s; three `gate_reused`).
+- **Refactor run** (AutoLeaseRank error handlers → `alr/api/errors.py`, planner v0.2.12): 6 tasks (one impl
+  task for the whole refactor, two parallel test tasks), $3.51 run + $0.79 planner, 425 s wall, worker sum
+  494 s → 1.16x. **Serial share 88%** (contract 111 s, integrate 74 s, review 188 s); no
+  `serial_bottleneck` (all within 3x). The slim contract took 111 s / $0.81 (vs 1350 s before). Integrate
+  changed nothing (0 files, $0.68): for a single-impl change whose tests already pass at merge, the
+  integrate node is pure overhead; candidate rule: skip it when the full gate passes after the last merge.
 - Reliability: 32 worker runs, 1 transient CLI failure (stdin race, fixed in v0.2.2), 1 gate failure
   from tests merged before their implementation (fixed by `merge_after`), 1 out-of-scope commit
   caught by review (fixed by scoped commits), 1 REJECT → reopen → APPROVE.

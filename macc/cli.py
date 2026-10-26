@@ -175,7 +175,13 @@ def cmd_change(a) -> int:
     if a.task not in g.tasks:
         print(f"unknown task {a.task}", file=sys.stderr)
         return 2
-    affected = g.update_spec(a.task, a.spec)
+    fields = {}
+    if a.owns:
+        fields["owns"] = a.owns
+    if a.done_when:
+        fields["done_when"] = a.done_when
+    affected = g.update_spec(a.task, a.spec if a.spec is not None else g.tasks[a.task].spec, **fields)
+    g.validate()
     store.save_graph(g)
     if a.why:
         store.add_decision(f"Spec change: {a.task}", a.why, affects=affected)
@@ -260,7 +266,9 @@ def main(argv=None) -> int:
     sp.add_argument("--no-guard", action="store_true", help="do not inject the ownership PreToolUse hook")
     sp.set_defaults(fn=cmd_run)
     sub.add_parser("status").set_defaults(fn=cmd_status)
-    sp = sub.add_parser("change"); sp.add_argument("task"); sp.add_argument("--spec", required=True)
+    sp = sub.add_parser("change"); sp.add_argument("task"); sp.add_argument("--spec", default=None)
+    sp.add_argument("--owns", action="append", default=None, help="replace ownership globs (repeatable)")
+    sp.add_argument("--done-when", action="append", default=None, help="replace gate commands (repeatable)")
     sp.add_argument("--why", default=None); sp.set_defaults(fn=cmd_change)
     sp = sub.add_parser("split"); sp.add_argument("parent"); sp.add_argument("--plan", required=True)
     sp.set_defaults(fn=cmd_split)

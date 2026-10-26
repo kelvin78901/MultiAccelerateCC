@@ -73,3 +73,14 @@ def test_plan_reload_keeps_finished_tasks(repo_dir, tmp_path, capsys):
     main(["--repo", r, "status"])
     out = capsys.readouterr().out
     assert "done      code      a" in out and "pending   code      b" in out
+
+
+def test_change_owns_and_done_when(repo_dir, tmp_path, capsys):
+    r = str(repo_dir)
+    p = tmp_path / "p.yaml"; p.write_text("tasks:\n  - {id: t, title: t, owns: ['a/**'], done_when: ['true']}\n")
+    main(["--repo", r, "init"]); main(["--repo", r, "plan", str(p)])
+    assert main(["--repo", r, "run", "--worker", "mock"]) == 0
+    assert main(["--repo", r, "change", "t", "--owns", "b/**", "--owns", "c.py", "--why", "renamed"]) == 0
+    from macc.store import Store
+    g = Store(repo_dir / ".macc" / "state.db").load_graph()
+    assert g.tasks["t"].owns == ["b/**", "c.py"] and g.tasks["t"].state == "pending"

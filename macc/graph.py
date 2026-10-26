@@ -141,11 +141,15 @@ class TaskGraph:
 
         for k in self.tasks:
             visit(k)
-        # a CONTRACT task must precede (be a dep of) everything that shares its ownership
+        # a CONTRACT task must precede (be a dep of) everything that shares its ownership.
+        # Finished work is exempt: tasks kept from an earlier plan (`macc plan` keeps DONE tasks) never run
+        # alongside the new contract's fan-out; if one is reopened, the runtime ownership check serialises it.
+        done = State.DONE.value
         for t in self.tasks.values():
-            if t.kind == Kind.CONTRACT.value:
+            if t.kind == Kind.CONTRACT.value and t.state != done:
                 for u in self.tasks.values():
-                    if u.id != t.id and self.owns_overlap(t, u) and t.id not in self.ancestors(u.id):
+                    if u.id != t.id and u.state != done and self.owns_overlap(t, u) \
+                            and t.id not in self.ancestors(u.id):
                         raise GraphError(
                             f"contract {t.id} overlaps {u.id} but is not an ancestor of it; "
                             "contracts must be serialised before fan-out"

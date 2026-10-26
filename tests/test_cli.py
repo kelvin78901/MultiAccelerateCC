@@ -117,3 +117,26 @@ def test_status_prints_last_critical_path(repo_dir, tmp_path, capsys):
     capsys.readouterr()
     assert main(["--repo", r, "status"]) == 0
     assert "last run critical path: a -> b: actual" in capsys.readouterr().out
+
+
+def test_plan_reload_ignores_finished_contract_overlap(repo_dir, tmp_path, capsys):
+    # plan 1: a contract that owns tests/conftest.py, run to DONE
+    p1 = tmp_path / "p1.yaml"
+    p1.write_text("tasks:\n  - id: c1\n    title: c1\n    kind: contract\n    owns: ['tests/conftest.py', 'a/**']\n"
+                  "  - id: a\n    title: a\n    deps: [c1]\n    owns: ['a/x/**']\n")
+    r = str(repo_dir)
+    assert main(["--repo", r, "plan", str(p1)]) == 0
+    assert main(["--repo", r, "run", "--worker", "mock", "--gate", "true"]) == 0
+    # plan 2: a new contract that also extends tests/conftest.py; c1 is finished and kept
+    p2 = tmp_path / "p2.yaml"
+    p2.write_text("tasks:\n  - id: c2\n    title: c2\n    kind: contract\n    owns: ['tests/conftest.py', 'b/**']\n"
+                  "  - id: b\n    title: b\n    deps: [c2]\n    owns: ['b/x/**']\n")
+    assert main(["--repo", r, "plan", str(p2)]) == 0
+    assert "ready now: ['c2']" in capsys.readouterr().out
+
+
+def test_unfinished_contract_overlap_still_rejected():
+    from macc.graph import GraphError, Task, TaskGraph
+    g = TaskGraph([Task("c", "c", kind="contract", owns=["api/**"]), Task("x", "x", owns=["api/x.py"])])
+    with pytest.raises(GraphError, match="contracts must be serialised"):
+        g.validate()

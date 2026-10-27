@@ -437,6 +437,40 @@ async def test_review_reopen_names_specific_tasks(repo):
     assert b_redone < integrate_ok < second_review
 
 
+async def test_review_reopening_integrate_runs_its_worker_even_when_gates_are_green(repo):
+    # REA #6404: REOPEN: integrate was answered by integrate_skipped (gates green, no worker), so the
+    # second review saw the same tree and rejected it again
+    tasks = [
+        Task("a", "a", owns=["a/**"]),
+        Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["a"], owns=["a/**"]),
+        Task("review", "r", kind=Kind.REVIEW.value, deps=["integrate"], owns=["docs/**"], max_attempts=2),
+    ]
+    worker = MockWorker()
+    orig = worker.__call__
+    rounds = {"n": 0}
+
+    async def w(task, wt, pack):
+        r = await orig(task, wt, pack)
+        if task.kind == "review":
+            rounds["n"] += 1
+            r.fields["notes_for_downstream"] = ("VERDICT: REJECT\nREOPEN: integrate\nmissing caller"
+                                                if rounds["n"] == 1 else "VERDICT: APPROVE")
+        return r
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    events = []
+    s = Scheduler(repo, store, g, w, SchedulerConfig(integration_gates=["true"]),
+                  on_event=lambda t, tid, p: events.append((t, tid, p)))
+    summary = await s.run()
+    assert summary["finished"], summary
+    seq = [(t, tid) for t, tid, p in events]
+    rejected = seq.index(("review_rejected", "review"))
+    after = seq[rejected:]
+    assert ("dispatched", "integrate") in after          # a worker answered the findings
+    assert ("integrate_skipped", "integrate") not in after
+    assert ("integrate_skipped", "integrate") in seq[:rejected]   # first time round it was a no-op
+
+
 async def test_cost_budget_is_cumulative_across_runs(repo):
     store = Store(repo.macc_dir / "state.db")
     store.add_usage("old", 1, "x", True, cost_usd=5.0)       # spent before this plan

@@ -210,6 +210,10 @@ class Scheduler:
             reasons.append(f"open_questions from {asked}")
         if not self.cfg.integration_gates:
             reasons.append("no integration gate to prove the tree is green")
+        # green gates do not answer a review's findings (REA #6404: REOPEN: integrate was skipped, and the
+        # unchanged tree was rejected again); last_error is cleared when the task next completes
+        if (t.last_error or "").startswith("review rejected"):
+            reasons.append("reopened by a review rejection")
         return reasons
 
     def _try_skip_integrate(self, t: Task) -> bool:

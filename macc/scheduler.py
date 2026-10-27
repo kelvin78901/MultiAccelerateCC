@@ -621,16 +621,34 @@ class Scheduler:
                 return
         # 6. done + staleness propagation
         self.store.save_handoff(tid, t.attempts, t.input_hash, out_hash, handoff)
+        reopened = (t.last_error or "").startswith("review rejected")
         t.last_error = None
         t.transients = 0
         changed = self.graph.mark_done(tid, out_hash)
         self._persist(tid, *changed)
         self.emit("done", tid, output_hash=out_hash, files=len(handoff["files_changed"]), stale=changed)
+        asked = (handoff.get("open_questions") or "").strip()
+        if reopened and not handoff["files_changed"] and asked:
+            self._hold_reviews(tid, asked)
         for c in changed:
             if c in self.running and self.graph.tasks[c].preempt:
                 self.running[c].cancel()
                 self.emit("preempt_requested", c, because=tid)
         self._cleanup(tid)
+
+    def _hold_reviews(self, tid: str, asked: str) -> None:
+        """A task reopened by a review changed nothing and asks a question (REA #6404: "grant integrate
+        ownership of scripts/verify-packaged-ghidra-windows.mjs"). Re-running the review would only reject
+        the same tree again, so the reviews downstream wait for a human (BLOCKED) with the question attached."""
+        held = [d for d in sorted(self.graph.descendants(tid)) if self.graph.tasks[d].kind == Kind.REVIEW.value
+                and self.graph.tasks[d].state in (State.PENDING.value, State.STALE.value)]
+        for d in held:
+            r = self.graph.tasks[d]
+            r.state = State.BLOCKED.value
+            r.last_error = f"{tid} was reopened by this review but changed nothing; it asks:\n{asked[:1500]}"
+        if held:
+            self._persist(*held)
+            self.emit("reopen_unanswered", tid, held=held, open_questions=asked[:500])
 
     def _prediction_vs_actual(self, wall: float) -> Optional[dict]:
         if not self.prediction:

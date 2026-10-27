@@ -496,6 +496,40 @@ async def test_changed_integrate_runs_its_worker_even_when_gates_are_green(repo)
     assert "integrate" in worker2.calls and ("integrate_skipped", "integrate") not in events2
 
 
+async def test_reopened_task_that_only_asks_holds_the_review(repo):
+    # REA #6404 round 3: integrate was reopened, could not touch an unowned file, changed nothing and asked
+    # for ownership in open_questions; the review then ran again and rejected the same tree
+    tasks = [
+        Task("a", "a", owns=["a/**"]),
+        Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["a"], owns=["a/**"]),
+        Task("review", "r", kind=Kind.REVIEW.value, deps=["integrate"], owns=["docs/**"], max_attempts=3),
+    ]
+    worker = MockWorker()
+    orig = worker.__call__
+    calls = {"review": 0, "integrate": 0}
+
+    async def w(task, wt, pack):
+        r = await orig(task, wt, pack)
+        if task.id in calls:
+            calls[task.id] += 1
+        if task.kind == "review":
+            r.fields["notes_for_downstream"] = "VERDICT: REJECT\nREOPEN: integrate\nfix x/y.mjs"
+        if task.id == "integrate":                         # it cannot touch x/y.mjs: no change, only a question
+            (wt / "a" / "integrate.txt").unlink(missing_ok=True)
+            r.fields["open_questions"] = "grant integrate ownership of x/y.mjs"
+        return r
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    events = []
+    s = Scheduler(repo, store, g, w, SchedulerConfig(integration_gates=["true"]),
+                  on_event=lambda t, tid, p: events.append((t, tid, p)))
+    await s.run()
+    assert calls["review"] == 1                              # not re-run on the unchanged tree
+    assert g.tasks["review"].state == State.BLOCKED.value
+    assert "grant integrate ownership" in g.tasks["review"].last_error
+    assert any(t == "reopen_unanswered" and tid == "integrate" for t, tid, p in events)
+
+
 async def test_cost_budget_is_cumulative_across_runs(repo):
     store = Store(repo.macc_dir / "state.db")
     store.add_usage("old", 1, "x", True, cost_usd=5.0)       # spent before this plan

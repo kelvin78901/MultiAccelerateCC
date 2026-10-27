@@ -104,7 +104,9 @@ def generate_handoff(repo: Repo, task: Task, wt_path: Path, gate_results: list[d
         "attempt": task.attempts,
         "files_changed": [{"status": s, "path": p} for s, p in files],
         "api_changes": api_changes,
-        "gates": [{"cmd": g["cmd"], "ok": g["ok"]} for g in gate_results],
+        # seconds (and whether the record was shared) so the operator can see what a gate really cost
+        "gates": [{"cmd": g["cmd"], "ok": g["ok"], "seconds": g.get("seconds"), "shared": bool(g.get("shared"))}
+                  for g in gate_results],
         "gates_passed": all(g["ok"] for g in gate_results) if gate_results else None,
         "stubs_detected": stub_hits,
         "stubs_declared": worker_fields.get("stubs", []),

@@ -242,7 +242,8 @@ class Scheduler:
             return False
         note = "skipped: gates green, nothing to integrate"
         handoff = {"task_id": t.id, "attempt": t.attempts, "files_changed": [], "api_changes": [],
-                   "gates": [{"cmd": g["cmd"], "ok": g["ok"]} for g in gates + own], "gates_passed": True,
+                   "gates": [{"cmd": g["cmd"], "ok": g["ok"], "seconds": g.get("seconds")} for g in gates + own],
+                   "gates_passed": True,
                    "stubs_detected": [], "stubs_declared": [], "open_questions": "",
                    "notes_for_downstream": note, "skipped": True, "integration_head": head}
         out_hash = "skipped-" + self.repo.tree(self.repo.integration_path)[:12]

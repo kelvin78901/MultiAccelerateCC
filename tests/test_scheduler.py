@@ -131,6 +131,14 @@ async def test_gate_failure_retries_with_error_context(repo):
     assert "Previous attempt failed" in ctx     # second attempt saw the error
 
 
+async def test_handoff_records_gate_seconds(repo):
+    # REA #6404: the operator could not tell how long the Java task's bridge-sources gate took
+    tasks = [Task("g", "g", owns=["x/**"], done_when=["sleep 0.2"])]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    gate = store.latest_handoff("g")["gates"][0]
+    assert gate["cmd"] == "sleep 0.2" and gate["ok"] and gate["seconds"] >= 0.2 and gate["shared"] is False
+
+
 async def test_gate_failure_keeps_the_head_of_long_output(repo):
     # REA verify:ghidra: "Error: Ghidra set_comment rejection drifted: {...10 KB JSON...}" then a stack;
     # the tail alone hid which operation drifted, so the retry could not tell what to fix

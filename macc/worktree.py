@@ -42,6 +42,14 @@ def _is_artifact(p: str) -> bool:
     return parts[-1] in ARTIFACT_FILES or p.endswith(ARTIFACT_SUFFIXES)
 
 
+def clip_output(text: str, head: int = 2000, tail: int = 4000) -> str:
+    """Keep both ends of command output: Node and Python put the failing assertion at the start of stderr and
+    the stack/summary at the end (REA verify:ghidra: the operation name was only in the cut-off head)."""
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[... {len(text) - head - tail} chars omitted ...]\n{text[-tail:]}"
+
+
 def _path_in_glob(p: str, g: str) -> bool:
     import fnmatch
     if fnmatch.fnmatch(p, g):
@@ -387,7 +395,7 @@ class Repo:
             p = subprocess.run(cmd, shell=True, cwd=str(where), capture_output=True, text=True,
                                timeout=timeout, env=env)
             rec = {"cmd": cmd, "ok": p.returncode == 0, "code": p.returncode,
-                   "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
+                   "stdout": clip_output(p.stdout), "stderr": clip_output(p.stderr)}
         except subprocess.TimeoutExpired:
             rec = {"cmd": cmd, "ok": False, "code": -1, "stdout": "", "stderr": f"timeout after {timeout} s"}
         rec["seconds"] = round(time.time() - t0, 2)

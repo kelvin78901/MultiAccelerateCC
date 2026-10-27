@@ -25,7 +25,7 @@ from .handoff import (build_context_pack, generate_handoff, interpreter_conflict
                       classify_path, parse_reopen, parse_verdict, public_api_delta, review_facts, review_risk)
 from .store import Store
 from .workers import WorkerFn, WorkerResult
-from .worktree import Repo
+from .worktree import Repo, clip_output
 
 
 @dataclass
@@ -233,7 +233,7 @@ class Scheduler:
         flaky = self._flake_check(t.id)
         if flaky:                             # the integrate worker runs, told which test is order/seed dependent
             t.last_error = f"new tests are flaky (passed the gate, failed under another seed): {flaky['cmd']}\n" \
-                           f"{flaky['stdout'][-1500:]}"
+                           f"{clip_output(flaky['stdout'], 700, 1500)}"
             self._persist(t.id)
             return False
         note = "skipped: gates green, nothing to integrate"
@@ -316,7 +316,7 @@ class Scheduler:
                 t.attempts = max(0, t.attempts - 1)       # the environment failed, not the task
                 t.state = State.BLOCKED.value
                 t.last_error = (f"worktree_setup failed: {bad['cmd']} (exit {bad['code']})\n"
-                                f"{bad['stderr'][-800:]}{bad['stdout'][-800:]}")
+                                f"{clip_output(bad['stderr'], 400, 800)}{clip_output(bad['stdout'], 400, 800)}")
                 self._persist(t.id)
                 self.emit("worktree_setup_failed", t.id, cmd=bad["cmd"], code=bad["code"], stderr=bad["stderr"][-300:])
                 self._cleanup(t.id)
@@ -470,7 +470,7 @@ class Scheduler:
         gates = await asyncio.to_thread(self.repo.run_gates, t.done_when, wt) if t.done_when else []
         if gates and not all(g["ok"] for g in gates):
             bad = next(g for g in gates if not g["ok"])
-            self._fail(t, f"gate failed: {bad['cmd']}\n{bad['stderr'][-1500:]}\n{bad['stdout'][-1500:]}")
+            self._fail(t, f"gate failed: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}\n{clip_output(bad['stdout'], 700, 1500)}")
             self._cleanup(tid)
             return
         if gates:
@@ -578,13 +578,13 @@ class Scheduler:
                     t.attempts = max(0, t.attempts - 1)       # do not charge the attempt
                     t.state = State.BLOCKED.value
                     t.last_error = (f"integration gate '{bad['cmd']}' fails on the baseline too; fix the "
-                                    f"environment and `macc retry {tid}`\n{bad['stderr'][-800:]}{bad['stdout'][-800:]}")
+                                    f"environment and `macc retry {tid}`\n{clip_output(bad['stderr'], 400, 800)}{clip_output(bad['stdout'], 400, 800)}")
                     self._persist(tid)
                     self.emit("gate_broken_baseline", tid, cmd=bad["cmd"])
                     self._cleanup(tid)
                     return
                 self.emit("integration_gate_failed", tid, cmd=bad["cmd"])
-                self._fail(t, f"integration gate failed after merge: {bad['cmd']}\n{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
+                self._fail(t, f"integration gate failed after merge: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}{clip_output(bad['stdout'], 700, 1500)}")
                 self._cleanup(tid)
                 return
             if t.kind == Kind.INTEGRATE.value:
@@ -592,7 +592,7 @@ class Scheduler:
                 if flaky:
                     self.repo.git("reset", "--hard", before, cwd=self.repo.integration_path)
                     self._fail(t, f"new tests are flaky (failed under another seed): {flaky['cmd']}\n"
-                                  f"{flaky['stdout'][-1500:]}")
+                                  f"{clip_output(flaky['stdout'], 700, 1500)}")
                     self._cleanup(tid)
                     return
             handoff["merge_commit"] = mr.merge_commit
@@ -605,7 +605,7 @@ class Scheduler:
             bad = self._ensure_full_gate(tid) or self._flake_check(tid)
             if bad:
                 self._fail(t, f"integrate changed nothing but a gate fails: {bad['cmd']}\n"
-                              f"{bad['stderr'][-1500:]}{bad['stdout'][-1500:]}")
+                              f"{clip_output(bad['stderr'], 700, 1500)}{clip_output(bad['stdout'], 700, 1500)}")
                 self._cleanup(tid)
                 return
         # 6. done + staleness propagation
@@ -680,7 +680,7 @@ class Scheduler:
             self._merged_since_full_gate = False
             return "passed"
         self.emit("final_gate_failed", None, cmd=bad["cmd"], merged=list(self.merged_this_run),
-                  output=(bad["stderr"][-800:] + bad["stdout"][-800:]))
+                  output=(clip_output(bad["stderr"], 400, 800) + clip_output(bad["stdout"], 400, 800)))
         return "failed"
 
     async def _merge_agent(self, t: Task, wt: Path) -> bool:

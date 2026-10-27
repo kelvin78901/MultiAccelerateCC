@@ -131,6 +131,25 @@ async def test_gate_failure_retries_with_error_context(repo):
     assert "Previous attempt failed" in ctx     # second attempt saw the error
 
 
+async def test_gate_failure_keeps_the_head_of_long_output(repo):
+    # REA verify:ghidra: "Error: Ghidra set_comment rejection drifted: {...10 KB JSON...}" then a stack;
+    # the tail alone hid which operation drifted, so the retry could not tell what to fix
+    cmd = ("python3 -c \"import sys; sys.stderr.write('Error: CAUSE-AT-HEAD ' + 'x' * 9000 + "
+           "' STACK-AT-TAIL'); sys.exit(1)\"")
+    tasks = [Task("g", "g", owns=["x/**"], done_when=[cmd], max_attempts=1)]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    err = g.tasks["g"].last_error
+    assert "CAUSE-AT-HEAD" in err and "STACK-AT-TAIL" in err and "chars omitted" in err
+    assert "CAUSE-AT-HEAD" in store.latest_event("failed")["payload"]["error"]
+
+
+def test_clip_output_keeps_both_ends():
+    from macc.worktree import clip_output
+    assert clip_output("short", 3, 3) == "short"
+    out = clip_output("A" * 10 + "B" * 100 + "C" * 10, 10, 10)
+    assert out.startswith("A" * 10) and out.endswith("C" * 10) and "100 chars omitted" in out
+
+
 async def test_integration_gate_reverts_merge(repo):
     tasks = [Task("bad", "bad", owns=["x/**"], max_attempts=1)]
     s, store, g, worker, events, summary = await run(

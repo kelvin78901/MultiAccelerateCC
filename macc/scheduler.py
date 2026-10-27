@@ -336,7 +336,7 @@ class Scheduler:
         head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
         tree = self.repo.tree(self.repo.integration_path) if head else None
         pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head,
-                                  integration_tree=tree)
+                                  integration_tree=tree, gate_cmds=list(self.cfg.integration_gates))
         run_as = t
         if t.kind == Kind.REVIEW.value:
             facts, run_as = self._review_setup(t, head)
@@ -483,6 +483,9 @@ class Scheduler:
             self.serial_seconds += sum(g.get("seconds", 0.0) for g in gates if not g.get("shared"))
         if gates and not all(g["ok"] for g in gates):
             bad = next(g for g in gates if not g["ok"])
+            if self._blocked_outside_owns(t, bad, wt):
+                self._cleanup(tid)
+                return
             self._fail(t, f"gate failed: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}\n{clip_output(bad['stdout'], 700, 1500)}")
             self._cleanup(tid)
             return
@@ -597,6 +600,9 @@ class Scheduler:
                     self._cleanup(tid)
                     return
                 self.emit("integration_gate_failed", tid, cmd=bad["cmd"])
+                if self._blocked_outside_owns(t, bad, self.repo.integration_path):
+                    self._cleanup(tid)
+                    return
                 self._fail(t, f"integration gate failed after merge: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}{clip_output(bad['stdout'], 700, 1500)}")
                 self._cleanup(tid)
                 return
@@ -785,6 +791,24 @@ class Scheduler:
         self._persist(*reviewed, *between)
         self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts, held=between)
         self._fail(review, "review rejected: " + notes[:1500])   # PENDING until max_attempts, then FAILED
+
+    def _blocked_outside_owns(self, t: Task, bad: dict, where) -> bool:
+        """A gate whose failure output points only at files the task does not own cannot be fixed by a retry
+        (REA #6404 r1: integrate re-ran 10 min and $1.89 against an unowned verifier). BLOCK it for a human."""
+        from .ownership import outside_owns, suggest_owner
+        tracked = set(self.repo.git("ls-files", cwd=where, check=False).stdout.split())
+        files = outside_owns(f"{bad.get('stderr', '')}\n{bad.get('stdout', '')}", tracked, t.owns)
+        if not files:
+            return False
+        owner = t.id if t.kind == Kind.INTEGRATE.value else suggest_owner(self.graph, exclude=t.id)
+        t.state = State.BLOCKED.value
+        t.last_error = (f"gate failed outside this task's owns: {bad['cmd']} points at {files[:10]}, which {t.id} may "
+                        f"not change, so a retry cannot fix it. Give them to {owner} (`macc change {owner} --owns ... "
+                        f"--spec ...`), then `macc retry {t.id}`.\n"
+                        f"{clip_output(bad.get('stderr', ''), 400, 800)}{clip_output(bad.get('stdout', ''), 400, 800)}")
+        self._persist(t.id)
+        self.emit("fails_outside_owns", t.id, cmd=bad["cmd"], files=files[:20], suggest=owner)
+        return True
 
     def _fail(self, t: Task, error: str, final: bool = False) -> None:
         t.last_error = error

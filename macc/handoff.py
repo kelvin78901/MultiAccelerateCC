@@ -260,8 +260,30 @@ def _full_gate_note(ev: dict, integration_head: Optional[str], integration_tree:
     return "\n".join(lines)
 
 
+HEAVY_GATE_S = 60.0   # a measured gate this slow is run by the scheduler only (REA verify:ghidra: 240 s, run twice)
+
+
+def scheduler_checks(task: Task, store: Store, gate_cmds: list[str]) -> str:
+    """Which commands the scheduler runs itself, and which of them the worker must not run (measured heavy)."""
+    secs = store.command_seconds()
+    mine = list(task.done_when) + [c for c in gate_cmds if c not in task.done_when]
+    heavy = [(c, secs[c]) for c in mine if secs.get(c, 0.0) >= HEAVY_GATE_S]
+    if not gate_cmds and not heavy:
+        return ""
+    lines = ["# Checks the scheduler runs for you",
+             "- When you finish, the scheduler runs your done_when in your worktree"
+             + (f"; after the merge it runs the integration gates {list(gate_cmds)}" if gate_cmds else "")
+             + ". A failure comes back to you with its output on the next attempt."]
+    if heavy:
+        lines.append("- Do NOT run these yourself; they are slow and the scheduler runs them anyway (measured): "
+                     + ", ".join(f"`{c}` (~{s:.0f} s)" for c, s in heavy)
+                     + ". Run quick targeted checks (the tests and files you changed) instead.")
+    return "\n".join(lines)
+
+
 def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "",
-                       integration_head: Optional[str] = None, integration_tree: Optional[str] = None) -> str:
+                       integration_head: Optional[str] = None, integration_tree: Optional[str] = None,
+                       gate_cmds: list[str] = ()) -> str:
     """The *only* thing a worker reads besides the repo itself. Short, stable prefix first (cacheable),
     task-specific material last."""
     parts: list[str] = []
@@ -273,7 +295,8 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         "- You are one worker in a parallel build. Other workers edit other paths concurrently.\n"
         f"- You may ONLY modify paths matching: {task.owns or ['(any, no ownership declared)']}. "
         "If you need a change elsewhere, do not make it; describe it in open_questions.\n"
-        "- Do not re-verify things already proven by passing tests. Run the done_when commands once at the end.\n"
+        "- Do not re-verify things already proven by passing tests. Run the done_when commands once at the end, "
+        "except the ones listed as heavy under 'Checks the scheduler runs for you'.\n"
         "- Fix root causes. If you choose a minimal fix or leave a stub, you MUST list it under `stubs` "
         "so it enters the debt registry. Mark stub code with the comment `TODO(macc)`.\n"
         "- Grep before you assume. Do not rely on memory of files you have not opened in this session.\n"
@@ -322,6 +345,9 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         f"allow_stubs: {task.allow_stubs}\n\n"
         f"{task.spec.strip()}"
     )
+    checks = scheduler_checks(task, store, list(gate_cmds))
+    if checks:
+        parts.append(checks)
     if task.kind == "spike":
         parts.append("# Spike output\nDo not write production code. You may search and read the web (the only "
                      "kind of task that can). Write `docs/spikes/" + task.id + ".md` for the tasks after you, who "

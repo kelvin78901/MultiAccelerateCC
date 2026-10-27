@@ -182,6 +182,29 @@ class Store:
             (task_id, attempt, input_hash, output_hash, json.dumps(data), time.time()),
         )
 
+    def command_seconds(self, exclude_window: Optional[tuple[float, float]] = None) -> dict[str, float]:
+        """Median measured seconds per gate command in this repository: done_when records in handoffs (a record
+        reused from a concurrent run is not counted twice), else `macc init --discover-gates` timings.
+        `exclude_window` (t0, t1) leaves out handoffs written then (leave-one-out backtest)."""
+        import statistics
+        xs: dict[str, list[float]] = {}
+        for r in self._conn.execute("SELECT data, created_at FROM handoffs"):
+            if exclude_window and exclude_window[0] <= r["created_at"] <= exclude_window[1]:
+                continue
+            for g in json.loads(r["data"]).get("gates") or []:
+                if g.get("cmd") and g.get("seconds") is not None and not g.get("shared"):
+                    xs.setdefault(g["cmd"], []).append(float(g["seconds"]))
+        out = {c: round(statistics.median(v), 2) for c, v in xs.items()}
+        disc = self.path.parent / "gate_discovery.json"
+        if disc.is_file():
+            try:
+                for t in json.loads(disc.read_text()).get("timed", []):
+                    if t.get("ok"):
+                        out.setdefault(t["cmd"], float(t["seconds"]))
+            except (ValueError, KeyError, TypeError):
+                pass
+        return out
+
     def latest_event(self, type_: str) -> Optional[dict]:
         r = self._conn.execute("SELECT * FROM events WHERE type=? ORDER BY seq DESC LIMIT 1", (type_,)).fetchone()
         if not r:

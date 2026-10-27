@@ -20,35 +20,53 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.2)
+## What it does today (v0.4.0)
 
-- **Planner in one call**: `macc plan --from "feature description"` inspects the repo read-only and emits a plan
-  YAML; the program validates it (cycles, contract-first, ownership overlap, missing gates) and you review it.
-- **Ownership is enforced, not suggested**: a PreToolUse hook blocks edits outside a task's `owns`.
-- **Independent review with teeth**: a `review` task's REJECT reopens the reviewed tasks with the notes; the
-  loop is bounded by the review task's `max_attempts`.
-- **Merge agent**: textual conflicts go to a worker that sees only the conflicting files plus both handoffs.
-- **Broken environment ≠ broken task**: a gate that fails on the baseline blocks the task without charging an attempt;
-  CLI start-up failures (stdin race, rate limit) are retried without charging either.
-- **Scoped commits**: only owned paths are committed; build artifacts are discarded; anything else a worker
-  touched (e.g. via Bash) fails the attempt.
-- **`merge_after`**: tests run in parallel with the implementation but merge only after it, so the
-  integration gate never runs new tests against old code.
+Scheduling
+- **Parallel fan-out** with a WIP limit; independent tasks never wait for each other; priority by critical path.
+- **Contract-first**: tasks of kind `contract` precede anything that depends on their interface.
+- **`merge_after`**: tests run in parallel with the implementation but merge only after it.
+- **Merge in topological order** into `macc/integration`, gates after every merge, automatic revert on failure.
+  Textual conflicts go to a merge agent that sees only the conflicting files plus both handoffs.
+- **Build-system staleness**: input hashes per task; a changed spec or upstream output makes downstream STALE
+  (running ones are preempted, no attempt charged); a STALE task whose gates still pass is DONE again.
+- **Crash-safe**: SQLite holds graph, events, handoffs, usage; `macc run` resumes.
 
-- **Parallel fan-out** with a WIP limit; independent tasks never wait for each other.
-- **Contract-first**: tasks of kind `contract` must precede anything touching the same paths.
-- **Ownership**: tasks declare the paths they may write; overlapping tasks are serialised.
-- **Build-system staleness**: every task has an input hash. Change a spec or an upstream output
-  and downstream tasks become STALE automatically; running ones are preempted (no attempt charged).
-- **Revalidation**: a STALE task whose gates still pass is DONE again without a rerun.
-- **Merge in topological order** into `macc/integration`, with gates after every merge and
-  automatic revert when they fail. Conflicts are detected and the task is retried on a fresh base.
-- **Handoffs generated from facts** (git diff, API-looking lines, gate results, stub markers); the
-  model writes only `open_questions`, `notes_for_downstream`, `stubs`.
-- **Debt registry**: every stub or minimal fix is recorded and shown to downstream tasks.
-- **Decisions** (ADR-style) injected into every later worker's context so changes aren't undone.
-- **Crash-safe**: SQLite holds the graph, events, handoffs, usage. `macc run` resumes.
-- **Budget**: stop dispatching when a token budget would be exceeded. Usage per kind feeds estimates.
+Planning
+- **Planner in one call**: `macc plan --from "..."` inspects the repo read-only and emits plan YAML; the program
+  validates it (cycles, contract limits, ownership overlap, missing done_when, impossible guards, review asking
+  for the full suite) and you review the file before `macc plan PLAN.yaml`.
+- **Ownership gaps (v0.4)**: identifiers the contract/code specs name (UPPER_SNAKE constants, camelCase /
+  PascalCase symbols, snake_case operation names) are grepped in `scripts/`, `tests/`, `docs/` and `src/**/*.test.*`;
+  files that mention them but that no task owns are listed, most likely first, with integrate as the suggested
+  owner (`macc plan PLAN.yaml --gaps` lists all). The planner prompt has the same rule.
+
+Gates
+- **Gate discovery**: `macc init --discover-gates` times the repo's own check/lint/format/typecheck/test targets
+  on the integration tree; `--pick` adds chosen ones to `integration_gates` (details below).
+- **Failures outside owns block (v0.4)**: when a `done_when` or integration gate fails and every file its output
+  points at (stack frames, `file:line`, FAIL lines) is outside the task's `owns`, the task is BLOCKED at once
+  (`fails_outside_owns`, with the files and a suggested owner) instead of retrying something it cannot fix.
+- **Heavy checks run once (v0.4)**: the context pack tells each worker which commands the scheduler runs for it
+  (done_when, integration gates) and names the measured slow ones (>= 60 s) it must not run itself.
+- **Broken environment != broken task**: a gate that fails on the baseline blocks without charging an attempt;
+  CLI start-up failures are retried without charging either. Gate output keeps both its head and its tail.
+- `worktree_setup` commands (e.g. symlink `node_modules`) run in every new worktree and before every gate.
+
+Workers and review
+- **Ownership is enforced**: a PreToolUse hook blocks edits outside `owns`; only owned paths are committed, build
+  artifacts are discarded, anything else fails the attempt.
+- **Handoffs generated from facts** (diff, API-looking lines, gate results with seconds, stub markers); the
+  model writes only `open_questions`, `notes_for_downstream`, `stubs`. Debts and decisions reach later workers.
+- **Review with teeth**: REJECT reopens the reviewed tasks with the notes (bounded by `max_attempts`); a reopened
+  or changed integrate is never skipped; a reopened task that changes nothing and only asks holds the review for
+  a human. Review tiering runs small fix-round reviews on a cheaper model.
+
+Cost model
+- `predict` gives wall time, cost and serial share from measured history (this repo plus `history_dbs`), with
+  per-task done_when time from this repo's gate records (v0.4) and the gate baseline; every run records its
+  prediction and the error. `macc backtest` replays every finished run leave-one-out.
+- Budgets: `--budget` (tokens) and `--cost-budget` (USD) stop dispatching.
 - **MockWorker**: the whole loop is testable at zero tokens.
 
 ## Install
@@ -74,8 +92,10 @@ macc run --parallel 3 --budget 400000             # real claude -p workers
 macc status
 macc change contract --spec "add auth" --why "customer asked for SSO"   # invalidates downstream
 macc split backend --plan sub.yaml                 # dynamic decomposition
+macc retry backend                                 # reset a FAILED/BLOCKED task
 macc debts
 macc events --follow                               # in a second terminal
+macc backtest                                      # prediction vs actual for every finished run
 ```
 
 `--discover-gates` reads package.json scripts, Makefile targets and pyproject.toml task tables (poe, pdm,

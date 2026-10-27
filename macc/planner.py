@@ -66,6 +66,11 @@ Inspect the repository (read-only) as needed before planning.
     module), not grep for keywords you yourself chose.
 13. If the repository already contains some or all of what the description asks for, plan the delta
     and say so in `config.scope_note` (one sentence). Never silently change the scope.
+14. Enumerations break silently. For every constant, operation name or exported symbol a contract or code
+    task adds to or changes, grep the repository (scripts/, tests/, docs/, and test files under src/) for
+    other files that list or assert on it: verifiers, inventories, catalogs, docs that count operations.
+    Each such file that the change affects must be owned by a task (usually integrate) whose spec names it.
+    An unowned file that breaks can only be fixed by a human.
 
 # Output
 Emit exactly one YAML document between the markers, nothing else after it:
@@ -395,5 +400,7 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
         out.write_text(text + "\n")
         cfg = (data.get("config") or {}) if isinstance(data, dict) else {}
         warns = plan_warnings(g, set(files), cfg.get("integration_gates"))
+        from .ownership import gap_warnings, ownership_gaps
+        warns += gap_warnings(ownership_gaps(g, workdir, files))
         return PlanResult(graph=g, warnings=warns, config=cfg, usage=usage)
     raise PlanError(f"planner could not produce a valid plan: {last_err}")

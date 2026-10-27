@@ -254,6 +254,17 @@ def cmd_plan(a) -> int:
     cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
+    from .ownership import gap_warnings, ownership_gaps
+    ipath = repo.ensure_integration()
+    gaps = ownership_gaps(g, ipath, repo.git("ls-files", cwd=ipath).stdout.split())
+    if gaps:
+        store.event("ownership_gaps", None, files=[x["file"] for x in gaps[:50]], suggest=gaps[0]["suggest"])
+        if a.gaps:
+            print(f"{len(gaps)} unowned file(s) mention identifiers from the specs (score, file, identifiers):")
+            for x in gaps:
+                print(f"  {x['score']:>5}  {x['file']}: {', '.join(x['idents'])}")
+        else:
+            print("WARNING: " + gap_warnings(gaps)[0])
     for line in _prediction_lines(g, store, cfg):
         print(line)
     return 0
@@ -470,6 +481,8 @@ def main(argv=None) -> int:
     sp.add_argument("--model", default=None); sp.add_argument("--effort", default="high")
     sp.add_argument("--timeout", type=int, default=900)
     sp.add_argument("--keep-all", action="store_true", help="keep unfinished tasks from earlier plans too")
+    sp.add_argument("--gaps", action="store_true",
+                    help="list every unowned file that mentions an identifier from the specs (default: the top 12)")
     sp.add_argument("--check-gate", action="store_true",
                     help="with --from: execute the planner's proposed integration gate on the baseline (model-written shell!)")
     sp.set_defaults(fn=cmd_plan)

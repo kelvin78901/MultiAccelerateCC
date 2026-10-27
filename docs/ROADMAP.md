@@ -292,6 +292,14 @@ is enough to warn when two parallel tasks' owns import each other.
 `serial_bottleneck` fires on a node the cost model says is splittable (rule in 1); never decompose
 parallel-phase tasks.
 
+## v0.4.0 — mechanisms from REA #6404 (done)
+Five rounds, $14.20, of which three rounds came from one gap (three unowned verifiers that enumerate Ghidra
+operations) and one from a missing 0.6 s gate. Built: plan-time ownership gaps (spec identifiers grepped in
+scripts/tests/docs, unowned hits ranked and attributed to integrate; on #6404's plan all three verifiers rank in
+the top 8 of 33), `fails_outside_owns` (a gate failing only in unowned files BLOCKS instead of retrying; on the
+r1 log it names scripts/verify-real-ghidra-inventory.mjs), scheduler-run heavy checks (context pack names
+measured >= 60 s commands; the cost model adds measured done_when time), and `init --discover-gates` (3e487bf).
+
 ## v0.4 — benchmark harness
 - [ ] Paired runs: native Claude Code vs macc on (a) SWE-bench Lite subset with `--parallel 1`,
       (b) 10 self-made multi-component tasks with oracle tests.

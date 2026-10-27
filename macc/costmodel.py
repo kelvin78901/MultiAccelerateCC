@@ -205,16 +205,20 @@ def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_
             exclude_usage: Iterable[int] = (), exclude_gate_seq: Iterable[int] = (),
             gates: bool = True, review_tiering: bool = True, low_model: str = "sonnet",
             fix_rounds: Optional[set[str]] = None, history_dbs: Iterable[str] = (),
-            gate_baseline_s: Optional[float] = None) -> dict:
+            gate_baseline_s: Optional[float] = None, command_s: Optional[dict] = None) -> dict:
     """Prediction for running `ids` (default: every task not DONE/CANCELLED). A STALE task with gates that
     is not a review is expected to revalidate (no worker, no time). A task is a fix round if it completed
     before (`fix_rounds`, default: it has a handoff). With review tiering on, a fix-round review is
-    predicted on the low-tier model (fix rounds are small changes), a first-round review on its planned one."""
+    predicted on the low-tier model (fix rounds are small changes), a first-round review on its planned one.
+    A task's duration is its worker time plus the measured time of its done_when commands (`command_s`, default
+    this repository's records): REA #6404's integrate spent 330 s in done_when after every worker run."""
     if ids is None:
         ids = {t.id for t in graph.tasks.values() if t.state not in (State.DONE.value, State.CANCELLED.value)}
     workers = {t for t in ids if not (graph.tasks[t].state == State.STALE.value and graph.tasks[t].done_when
                                       and graph.tasks[t].kind != Kind.REVIEW.value)}
     rows = history(store, exclude_usage, history_dbs)
+    if command_s is None:
+        command_s = store.command_seconds()
     serial = static_serial_points(graph, workers)
     if fix_rounds is None:
         fix_rounds = {t for t in workers if store.latest_handoff(t) is not None}
@@ -226,8 +230,9 @@ def predict(graph: TaskGraph, store: Store, ids: Optional[set[str]] = None, max_
         if task.kind == Kind.REVIEW.value and review_tiering and fix:
             family = model_family(low_model)
         secs, cost, src, level, n = _estimate(task.kind, family, fix, t in serial, rows, task.est_minutes)
-        per[t] = {"seconds": round(secs, 1), "cost": round(cost, 4), "serial": t in serial, "fix_round": fix,
-                  "model": family, "source": src, "level": level, "n": n}
+        dw = sum(command_s.get(c, 0.0) for c in task.done_when)
+        per[t] = {"seconds": round(secs + dw, 1), "cost": round(cost, 4), "serial": t in serial, "fix_round": fix,
+                  "model": family, "source": src, "level": level, "n": n, "done_when_s": round(dw, 1)}
     dur = {t: per[t]["seconds"] for t in workers}
     phase_times = []
     for _, group in sorted(_phases(graph, workers, serial).items()):
@@ -331,13 +336,16 @@ def backtest(store: Store, history_dbs: Iterable[str] = ()) -> dict:
             graph.tasks[t].state = State.PENDING.value
         for t in no_worker:
             graph.tasks[t].state = State.STALE.value
+        ts = conn.execute("SELECT MIN(ts) a, MAX(ts) b FROM events WHERE seq BETWEEN ? AND ?",
+                          (st["seq"], end["seq"])).fetchone()
         completed = {e["task_id"] for e in evs if e["seq"] < st["seq"]
                      and e["type"] in ("done", "revalidated", "integrate_skipped")}
         pred = predict(graph, store, ids=ids, max_parallel=json.loads(st["payload"] or "{}").get("max_parallel", 4),
                        exclude_usage=[u["id"] for u in usage],
                        exclude_gate_seq=[e["seq"] for e in run_evs if e["type"] == "full_gate"],
                        review_tiering=any(e["type"] == "review_tier" for e in run_evs),
-                       fix_rounds=ids & completed, history_dbs=history_dbs)
+                       fix_rounds=ids & completed, history_dbs=history_dbs,
+                       command_s=store.command_seconds(exclude_window=(ts["a"], ts["b"])))
         for t, state in saved.items():
             graph.tasks[t].state = state
         wall = json.loads(end["payload"])["seconds"]

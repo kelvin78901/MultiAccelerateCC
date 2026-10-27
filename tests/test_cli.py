@@ -181,3 +181,47 @@ def test_init_history_and_gate_baseline_survive_plan_load(repo_dir, tmp_path, ca
     assert cfg["integration_gates"] == ["true"] and cfg["max_parallel"] == 2
     assert main(["--repo", r, "backtest"]) == 0
     assert "history: this repo + 1 other db(s)" in capsys.readouterr().out
+
+
+def test_init_runs_worktree_setup_before_the_gate(repo_dir, capsys):
+    import json
+    r = str(repo_dir)
+    # the gate needs what the setup creates (REA: check:fast needs the symlinked node_modules)
+    assert main(["--repo", r, "init", "--setup", "ln -sfn \"$MACC_REPO_ROOT/README.md\" linked.md",
+                 "--gate", "test -f linked.md", "--gate-timeout", "60"]) == 0
+    out = capsys.readouterr().out
+    assert "gate verified" in out and "WARNING" not in out
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["worktree_setup"] == ["ln -sfn \"$MACC_REPO_ROOT/README.md\" linked.md"]
+    assert cfg["gate_timeout"] == 60 and cfg["gate_baseline_s"] >= 0
+    # an explicit baseline wins over the measured one (a warm build cache makes the measurement meaningless)
+    assert main(["--repo", r, "init", "--gate-baseline", "7.8"]) == 0
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["gate_baseline_s"] == 7.8 and cfg["worktree_setup"]
+
+
+def test_init_failing_setup_skips_the_gate(repo_dir, capsys):
+    import json
+    r = str(repo_dir)
+    assert main(["--repo", r, "init", "--setup", "false", "--gate", "true"]) == 0
+    out = capsys.readouterr().out
+    assert "worktree_setup fails" in out and "gate verified" not in out
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["integration_gates"] == ["true"] and "gate_baseline_s" not in cfg
+
+
+def test_plan_from_prediction_keeps_repo_keys(repo_dir, tmp_path, monkeypatch, capsys):
+    import macc.cli as cli
+    other = tmp_path / "other.db"
+    other.write_text("")
+    r = str(repo_dir)
+    import json
+    assert main(["--repo", r, "init", "--history", str(other)]) == 0
+    cfgp = repo_dir / ".macc" / "config.json"
+    cfgp.write_text(json.dumps({**json.loads(cfgp.read_text()), "gate_baseline_s": 8}))
+    seen = {}
+    monkeypatch.setattr(cli, "_prediction_lines", lambda g, store, cfg: seen.update(cfg) or [])
+    # the mock planner's plan has its own config block (max_parallel, integration_gates, ...)
+    assert main(["--repo", r, "plan", "--from", "todo app", "--worker", "mock", str(tmp_path / "p.yaml")]) == 0
+    assert seen["history_dbs"] == [str(other.resolve())] and seen["gate_baseline_s"] == 8
+    assert seen["max_parallel"] == 3                     # plan keys still come from the planner

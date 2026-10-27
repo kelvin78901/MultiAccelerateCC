@@ -58,9 +58,22 @@ def cmd_init(a) -> int:
         rules.write_text("# Project rules for macc workers\n\n- Keep this file short. Only things a model would guess wrong.\n")
     cfgp = repo.macc_dir / "config.json"
     cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
+    if a.setup:
+        cfg["worktree_setup"] = a.setup
+    if a.gate_timeout is not None:
+        cfg["gate_timeout"] = a.gate_timeout
+    repo.gate_timeout = int(cfg.get("gate_timeout", 1800))
+    setup_ok = True
+    if cfg.get("worktree_setup"):                 # the gate below runs in the integration worktree: set it up first
+        bad = repo.run_setup(cfg["worktree_setup"], repo.integration_path)
+        if bad:
+            setup_ok = False
+            print(f"WARNING: worktree_setup fails in the integration worktree: {bad['cmd']!r} (exit {bad['code']})\n"
+                  f"{bad['stderr'][-600:]}")
     if a.gate:
         cfg["integration_gates"] = a.gate
-        res = repo.run_gates(a.gate, timeout=int(cfg.get("gate_timeout", 1800)))
+    if a.gate and setup_ok:
+        res = repo.run_gates(a.gate)
         bad = [r for r in res if not r["ok"]]
         if bad:
             print(f"WARNING: gate fails on the current integration tree: {bad[0]['cmd']!r}\n{bad[0]['stderr'][-600:]}{bad[0]['stdout'][-600:]}")
@@ -68,6 +81,8 @@ def cmd_init(a) -> int:
             # this repo's own gate time: the cost model uses it (worker times may come from other repos)
             cfg["gate_baseline_s"] = round(sum(r.get("seconds", 0.0) for r in res), 2)
             print(f"gate verified on integration tree: {a.gate} ({cfg['gate_baseline_s']} s)")
+    if a.gate_baseline is not None:               # e.g. a build cache made the measured run unrepresentative
+        cfg["gate_baseline_s"] = a.gate_baseline
     for h in a.history or []:
         path = str(Path(h).expanduser().resolve())
         if not Path(path).is_file():
@@ -116,6 +131,7 @@ def cmd_plan(a) -> int:
         existing = repo.git("ls-files", cwd=ipath).stdout.split()
         cfg_now = json.loads((repo.macc_dir / "config.json").read_text()) if (repo.macc_dir / "config.json").exists() else {}
         gate_now = " && ".join(cfg_now.get("integration_gates", []))
+        repo.gate_timeout = int(cfg_now.get("gate_timeout", 1800))
         pr = asyncio.run(generate_plan(a.from_desc, ipath, worker, out, effort=a.effort, model=a.model,
                                        existing_files=existing, current_gate=gate_now,
                                        history=store.history_by_kind()))
@@ -148,7 +164,12 @@ def cmd_plan(a) -> int:
                 if bad:
                     pr.warnings.append(f"proposed integration gate FAILS on the current integration tree: {bad[0]['cmd']!r} "
                                        f"-> every task would be BLOCKED (gate_broken_baseline)")
-        pr.warnings.extend(_prediction_lines(g, store, pr.config or cfg_now))
+        # the planner's config holds plan keys (scope_note, max_parallel, ...); repo keys come from config.json
+        pred_cfg = {**cfg_now, **(pr.config or {})}
+        for k in REPO_KEYS:
+            if k in cfg_now and k not in (pr.config or {}):
+                pred_cfg[k] = cfg_now[k]
+        pr.warnings.extend(_prediction_lines(g, store, pred_cfg))
         if pr.warnings:
             print("\nWARNINGS (fix before `macc plan`):")
             for w in pr.warnings:
@@ -383,6 +404,11 @@ def main(argv=None) -> int:
                                                  help="integration gate command (repeatable); recorded in config.json and seen by the planner")
     sp.add_argument("--history", action="append", default=None,
                     help="another macc state.db whose worker history calibrates the cost model (repeatable, appends)")
+    sp.add_argument("--setup", action="append", default=None,
+                    help="worktree_setup command (repeatable, replaces the list); run in the integration worktree before the gate")
+    sp.add_argument("--gate-timeout", type=int, default=None, help="seconds per gate command (config gate_timeout)")
+    sp.add_argument("--gate-baseline", type=float, default=None,
+                    help="record this gate time (s) instead of the measured one (e.g. the measured run hit a build cache)")
     sp.set_defaults(fn=cmd_init)
     sp = sub.add_parser("plan"); sp.add_argument("plan", nargs="?", default=None)
     sp.add_argument("--from", dest="from_desc", default=None, help="feature description -> generate PLAN.yaml with one planner call")

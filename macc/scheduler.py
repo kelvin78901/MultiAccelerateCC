@@ -218,6 +218,9 @@ class Scheduler:
         integration tree; then mark it DONE without a worker."""
         if not self.cfg.skip_noop_integrate or self._integrate_blockers(t):
             return False
+        t0 = time.time()
+        # its gates block everything downstream with no worker running: serial time like a serial worker's
+        serial = not self.running and self._is_global_serial_point(t)
         head = self.repo.head(self.repo.integration_path)
         last = self.store.latest_event("full_gate")
         reuse = bool(last and last["payload"].get("ok") and self._gate_covers_current_tree(last))
@@ -242,8 +245,12 @@ class Scheduler:
         self.store.save_handoff(t.id, t.attempts, t.input_hash, out_hash, handoff)
         changed = self.graph.mark_done(t.id, out_hash)
         self._persist(t.id, *changed)
+        seconds = round(time.time() - t0, 2)
+        if serial:
+            self._serial_points.add(t.id)
+            self.serial_seconds += seconds
         self.emit("integrate_skipped", t.id, head=head, reused_full_gate=reuse,
-                  gates=[g["cmd"] for g in gates + own], note=note)
+                  gates=[g["cmd"] for g in gates + own], note=note, seconds=seconds, serial=serial)
         return True
 
     def _dispatch_ready(self) -> int:

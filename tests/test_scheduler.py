@@ -734,6 +734,21 @@ async def test_noop_integrate_is_skipped_when_gates_green_and_nothing_open(repo)
     assert g.tasks["i"].state == State.DONE.value
 
 
+async def test_skipped_integrate_gate_time_counts_as_serial(repo):
+    # REA #7296: a skipped integrate ran 77 s of gates with every task waiting, but counted 0 s serial
+    tasks = _integrate_plan()
+    tasks[2].done_when = ["sleep 0.3", "test -f a/a.txt"]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["true"])
+    ev = store.latest_event("integrate_skipped")["payload"]
+    assert ev["serial"] is True and ev["seconds"] >= 0.3
+    assert "i" in summary["serial"]["tasks"] and summary["serial"]["seconds"] >= 0.3
+    from macc.costmodel import backtest
+    row = backtest(store)["runs"][0]
+    worker_serial = sum(u["seconds"] for u in store._conn.execute(
+        "SELECT seconds FROM usage WHERE serial = 1").fetchall())
+    assert row["actual"]["serial_share"] * row["actual"]["wall_s"] >= worker_serial + 0.29
+
+
 async def test_integrate_runs_when_a_debt_is_open(repo):
     s, store, g, worker, events, summary = await run(
         repo, _integrate_plan(spec="mock:stub", allow_stubs=True), integration_gates=["true"])

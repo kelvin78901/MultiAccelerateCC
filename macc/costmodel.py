@@ -342,7 +342,10 @@ def backtest(store: Store, history_dbs: Iterable[str] = ()) -> dict:
             graph.tasks[t].state = state
         wall = json.loads(end["payload"])["seconds"]
         cost = sum(u["cost_usd"] for u in usage)
-        ser = sum(u["seconds"] for u in usage if u["serial"] == 1) / wall if wall else 0.0
+        # a skipped integrate has no usage row, but its gates ran with everything else waiting
+        skip_s = sum(json.loads(e["payload"] or "{}").get("seconds", 0.0) for e in run_evs
+                     if e["type"] == "integrate_skipped" and json.loads(e["payload"] or "{}").get("serial"))
+        ser = (sum(u["seconds"] for u in usage if u["serial"] == 1) + skip_s) / wall if wall else 0.0
         rows.append({"run_seq": st["seq"], "tasks": len(ids), "pred": {k: pred[k] for k in ("wall_s", "cost_usd",
                      "serial_share")}, "actual": {"wall_s": wall, "cost_usd": round(cost, 3), "serial_share": round(ser, 3)},
                      "error": error(pred, wall, cost, ser)})

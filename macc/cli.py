@@ -1,6 +1,7 @@
 """macc command line.
 
   macc init  [--repo .]                       create .macc/, integration branch, state db
+             [--discover-gates] [--pick N]    time the repo's own checks; pick integration gates from them
   macc plan  PLAN.yaml [--repo .]             load a plan into the state db (replaces pending graph)
   macc run   [--repo .] [--worker claude|mock] [--parallel N] [--budget TOKENS] [--gate CMD ...]
   macc status [--repo .]                      print graph state, debts, usage
@@ -82,6 +83,7 @@ def cmd_init(a) -> int:
             # this repo's own gate time: the cost model uses it (worker times may come from other repos)
             cfg["gate_baseline_s"] = round(sum(r.get("seconds", 0.0) for r in res), 2)
             print(f"gate verified on integration tree: {a.gate} ({cfg['gate_baseline_s']} s)")
+    picked_ok = _discover_gates(a, repo, cfg) if (a.discover_gates or a.pick) and setup_ok else True
     if a.gate_baseline is not None:               # e.g. a build cache made the measured run unrepresentative
         cfg["gate_baseline_s"] = a.gate_baseline
     for h in a.history or []:
@@ -93,7 +95,49 @@ def cmd_init(a) -> int:
             dbs.append(path)
     cfgp.write_text(json.dumps(cfg, indent=2))
     print(f"initialised {repo.macc_dir} (integration branch + state db); gates={cfg.get('integration_gates', [])}")
-    return 0
+    return 0 if picked_ok else 1
+
+
+def _discover_gates(a, repo: Repo, cfg: dict) -> bool:
+    """--discover-gates times the repo's own check targets; --pick (or the prompt) appends chosen ones to
+    integration_gates. Picks without --discover-gates reuse the last discovery, so nothing is timed twice."""
+    from . import gates
+    import os
+    saved = repo.macc_dir / gates.RESULTS_FILE
+    if a.discover_gates:
+        try:
+            rec = gates.discover(repo.integration_path, repo.integration_path, {**os.environ, **repo.macc_env()},
+                                 int(cfg.get("gate_timeout", 1800)), exclude=a.discover_exclude or [],
+                                 budget_s=a.discover_budget)
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            return False
+        saved.write_text(json.dumps(rec, indent=2))
+    elif saved.exists():
+        rec = json.loads(saved.read_text())
+        print(f"using the discovery of tree {rec['tree'][:12]} ({saved})")
+    else:
+        print("ERROR: --pick needs a discovery first: run `macc init --discover-gates`")
+        return False
+    for line in gates.format_report(rec):
+        print(line)
+    picks = a.pick or []
+    if not picks and a.discover_gates and gates.candidates(rec) and sys.stdin.isatty():
+        picks = [input("add which to integration_gates (numbers or names, comma-separated; empty = none)? ")]
+    if not picks:
+        if gates.candidates(rec):
+            print("nothing added; pick with `macc init --pick N[,N...]` (reuses this discovery)")
+        return True
+    chosen, errors = gates.resolve_picks(rec, picks)
+    for e in errors:
+        print(f"ERROR: not added: {e}")
+    current = cfg.setdefault("integration_gates", [])
+    added = [t for t in chosen if t["cmd"] not in current]
+    current += [t["cmd"] for t in added]
+    if added:                                     # the cost model's gate time grows by what was measured here
+        cfg["gate_baseline_s"] = round(cfg.get("gate_baseline_s", 0.0) + sum(t["seconds"] for t in added), 2)
+        print(f"added {[t['cmd'] for t in added]}; gate_baseline_s = {cfg['gate_baseline_s']}")
+    return not errors
 
 
 def _prediction_lines(g, store: Store, cfg: dict) -> list[str]:
@@ -410,6 +454,15 @@ def main(argv=None) -> int:
     sp.add_argument("--gate-timeout", type=int, default=None, help="seconds per gate command (config gate_timeout)")
     sp.add_argument("--gate-baseline", type=float, default=None,
                     help="record this gate time (s) instead of the measured one (e.g. the measured run hit a build cache)")
+    sp.add_argument("--discover-gates", action="store_true",
+                    help="time the repo's check/lint/format/typecheck/test targets on the integration tree and list "
+                         "those passing in under half of gate_timeout (saved to .macc/gate_discovery.json)")
+    sp.add_argument("--discover-exclude", action="append", default=None, metavar="REGEX",
+                    help="with --discover-gates: also skip targets whose name matches (repeatable)")
+    sp.add_argument("--discover-budget", type=float, default=None, metavar="SECONDS",
+                    help="with --discover-gates: stop timing new targets after this much total time")
+    sp.add_argument("--pick", action="append", default=None,
+                    help="discovered candidates to append to integration_gates: list numbers, names or commands")
     sp.set_defaults(fn=cmd_init)
     sp = sub.add_parser("plan"); sp.add_argument("plan", nargs="?", default=None)
     sp.add_argument("--from", dest="from_desc", default=None, help="feature description -> generate PLAN.yaml with one planner call")

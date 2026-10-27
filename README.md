@@ -65,6 +65,8 @@ python -m pytest -q
 ```bash
 cd /path/to/your/repo
 macc init
+macc init --discover-gates                         # time the repo's check/lint/format/typecheck/test targets
+macc init --pick 1,3                               # append chosen candidates to integration_gates
 macc plan --from "Add a todo API with a web UI and e2e tests" plan.yaml   # or hand-write it
 macc plan plan.yaml
 macc run --worker mock --parallel 4 --gate true   # dry run, no tokens
@@ -75,6 +77,13 @@ macc split backend --plan sub.yaml                 # dynamic decomposition
 macc debts
 macc events --follow                               # in a second terminal
 ```
+
+`--discover-gates` reads package.json scripts, Makefile targets and pyproject.toml task tables (poe, pdm,
+hatch, taskipy, plus ruff/black/mypy/pytest when configured), runs each once in the integration worktree and
+lists the ones that pass in under half of `gate_timeout`, fastest first. Watch, fix, coverage, CI-aggregate and
+in-place format targets are skipped; one that changes the tree is undone and rejected. Results are saved to
+`.macc/gate_discovery.json`, so `--pick` does not time anything again. Exported env applies (e.g.
+`TURBO_FORCE=true` so a turbo cache replay does not pass for a fast gate).
 
 Project-specific rules for workers go in `.macc/rules.md` (keep it short; it is prepended to
 every context pack and should stay byte-identical for cache hits).

@@ -237,3 +237,82 @@ def test_flake_check_off_survives_plan_load(repo_dir, tmp_path):
     plan.write_text("config:\n  max_parallel: 2\ntasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n")
     assert main(["--repo", r, "plan", str(plan)]) == 0
     assert json.loads(cfgp.read_text())["flake_check_runs"] == 0
+
+
+def _commit(root, files: dict):
+    for name, text in files.items():
+        (root / name).write_text(text)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "targets"], cwd=root, check=True)
+
+
+def test_find_candidates_reads_package_makefile_and_pyproject(tmp_path):
+    import json
+    from macc.gates import find_candidates
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {
+        "build": "tsc -b", "format": "oxfmt .", "format:check": "oxfmt --check .", "lint": "oxlint",
+        "precheck": "node deps.mjs", "check": "turbo run typecheck lint", "check:pr": "turbo run typecheck lint",
+        "test:watch": "vitest", "test": "vitest run", "metadata:check": "node gen.mjs --check", "knip": "knip",
+        "verify:cross-format": "node v.mjs", "test:prepare": "tsc -b"}}))
+    (tmp_path / "pnpm-lock.yaml").write_text("")
+    (tmp_path / "Makefile").write_text("FOO := 1\n.PHONY: lint\nlint typecheck: deps\n\tcheck\n%.o: %.c\nbuild:\n")
+    (tmp_path / "pyproject.toml").write_text('[tool.ruff]\nline-length = 100\n[tool.poe.tasks]\ntest = "pytest"\n')
+    keep, skipped = find_candidates(tmp_path)
+    cmds = [c["cmd"] for c in keep]
+    # format first, tests last; pnpm detected from its lockfile; lifecycle hooks and non-check targets left out
+    assert cmds[0] == "pnpm run format:check" and cmds[-1] == "poe test"
+    assert {"pnpm run lint", "pnpm run knip", "pnpm run metadata:check", "make lint", "make typecheck",
+            "ruff check .", "ruff format --check ."} <= set(cmds)
+    assert not {"pnpm run build", "pnpm run precheck", "make build", "make FOO"} & set(cmds)
+    # identical bodies are timed once and listed as aliases
+    check = next(c for c in keep if c["cmd"] == "pnpm run check")
+    assert check["aliases"] == ["pnpm run check:pr"] and "pnpm run check:pr" not in cmds
+    reasons = {s["cmd"]: s["reason"] for s in skipped}
+    assert "watch" in reasons["pnpm run test:watch"] and "in place" in reasons["pnpm run format"]
+    assert "pnpm run verify:cross-format" not in reasons and "prepare" in reasons["pnpm run test:prepare"]
+    keep, skipped = find_candidates(tmp_path, exclude=["^test$"])
+    assert "pnpm run test" not in [c["cmd"] for c in keep]
+
+
+def test_discover_gates_times_lists_and_picks(repo_dir, capsys):
+    import json
+    _commit(repo_dir, {
+        "package.json": json.dumps({"scripts": {
+            "format:check": "true", "lint": "exit 3", "typecheck": "touch generated.txt",
+            "test": "sleep 5", "check": "test -f package.json"}}),
+        ".gitignore": "node_modules\n"})
+    r = str(repo_dir)
+    # gate_timeout 4: the limit is 2 s, so `sleep 5` is killed rather than waited for
+    assert main(["--repo", r, "init", "--gate-timeout", "4", "--discover-gates"]) == 0
+    out = capsys.readouterr().out
+    assert "npm run format:check" in out and "fails (exit 3)" in out and "modifies the tree" in out
+    assert "over 2 s (killed)" in out and "nothing added" in out
+    integ = repo_dir / ".macc" / "worktrees" / "_integration"
+    assert not (integ / "generated.txt").exists()          # what a candidate wrote is undone
+    rec = json.loads((repo_dir / ".macc" / "gate_discovery.json").read_text())
+    by_cmd = {t["cmd"]: t for t in rec["timed"]}
+    assert by_cmd["npm run test"]["seconds"] < 4.5 and not by_cmd["npm run test"]["ok"]
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert "integration_gates" not in cfg
+    # picking reuses the saved discovery (nothing is timed again); failing ones are refused with their status
+    import re
+    num = re.search(r"(\d+)\.\s+[\d.]+ s  npm run format:check", out).group(1)   # numbers follow the printed list
+    assert main(["--repo", r, "init", "--pick", num, "--pick", "npm run check,npm run lint"]) == 1
+    out = capsys.readouterr().out
+    assert "using the discovery" in out and "timing" not in out and "'npm run lint': fails (exit 3)" in out
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert sorted(cfg["integration_gates"]) == ["npm run check", "npm run format:check"]
+    assert cfg["gate_baseline_s"] == round(by_cmd["npm run check"]["seconds"]
+                                           + by_cmd["npm run format:check"]["seconds"], 2)
+    assert main(["--repo", r, "init", "--pick", "npm run check"]) == 0     # already a gate: not added twice
+    cfg = json.loads((repo_dir / ".macc" / "config.json").read_text())
+    assert cfg["integration_gates"].count("npm run check") == 1
+
+
+def test_pick_without_discovery_and_dirty_tree_are_errors(repo_dir, capsys):
+    r = str(repo_dir)
+    assert main(["--repo", r, "init", "--pick", "1"]) == 1
+    assert "needs a discovery first" in capsys.readouterr().out
+    (repo_dir / ".macc" / "worktrees" / "_integration" / "stray.txt").write_text("x")
+    assert main(["--repo", r, "init", "--discover-gates"]) == 1
+    assert "uncommitted changes" in capsys.readouterr().out

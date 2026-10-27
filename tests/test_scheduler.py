@@ -479,6 +479,23 @@ async def test_review_reopening_integrate_runs_its_worker_even_when_gates_are_gr
     assert ("integrate_skipped", "integrate") in seq[:rejected]   # first time round it was a no-op
 
 
+async def test_changed_integrate_runs_its_worker_even_when_gates_are_green(repo):
+    # REA #6404: `macc change integrate` with review findings, gates already green -> it must not be skipped
+    tasks = [Task("a", "a", owns=["a/**"]),
+             Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["a"], owns=["a/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["true"])
+    assert ("integrate_skipped", "integrate") in events and "integrate" not in worker.calls
+    g.update_spec("integrate", "fix the review findings")
+    store.save_graph(g)
+    store.event("spec_changed", "integrate", affected=["integrate"])
+    events2 = []
+    worker2 = MockWorker()
+    s2 = Scheduler(repo, store, store.load_graph(), worker2, SchedulerConfig(integration_gates=["true"]),
+                   on_event=lambda t, tid, p: events2.append((t, tid)))
+    assert (await s2.run())["finished"]
+    assert "integrate" in worker2.calls and ("integrate_skipped", "integrate") not in events2
+
+
 async def test_cost_budget_is_cumulative_across_runs(repo):
     store = Store(repo.macc_dir / "state.db")
     store.add_usage("old", 1, "x", True, cost_usd=5.0)       # spent before this plan

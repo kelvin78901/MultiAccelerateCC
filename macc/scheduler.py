@@ -214,6 +214,12 @@ class Scheduler:
         # unchanged tree was rejected again); last_error is cleared when the task next completes
         if (t.last_error or "").startswith("review rejected"):
             reasons.append("reopened by a review rejection")
+        # likewise an operator's `macc change` since the task last completed: the new spec is work to do
+        last = self.store._conn.execute(
+            "SELECT type FROM events WHERE task_id=? AND type IN ('spec_changed','done','integrate_skipped') "
+            "ORDER BY seq DESC LIMIT 1", (t.id,)).fetchone()
+        if last and last["type"] == "spec_changed":
+            reasons.append("spec changed since it last completed")
         return reasons
 
     def _try_skip_integrate(self, t: Task) -> bool:

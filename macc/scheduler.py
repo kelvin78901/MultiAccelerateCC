@@ -479,6 +479,8 @@ class Scheduler:
 
         # 2. task-level gates (done_when) inside the worktree
         gates = await asyncio.to_thread(self.repo.run_gates, t.done_when, wt) if t.done_when else []
+        if tid in self._serial_points:   # everything still waits while a serial task's gates run (REA: 330 s)
+            self.serial_seconds += sum(g.get("seconds", 0.0) for g in gates if not g.get("shared"))
         if gates and not all(g["ok"] for g in gates):
             bad = next(g for g in gates if not g["ok"])
             self._fail(t, f"gate failed: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}\n{clip_output(bad['stdout'], 700, 1500)}")
@@ -689,6 +691,8 @@ class Scheduler:
     def _record_gates(self, tid: Optional[str], gates: list[dict], full: bool) -> None:
         secs = round(sum(g.get("seconds", 0.0) for g in gates), 2)
         self.gate_seconds += secs
+        if tid in self._serial_points:   # post-merge gates of a serial task block everything as well
+            self.serial_seconds += secs
         if full and gates:
             bad = next((g for g in gates if not g["ok"]), None)
             self.emit("full_gate", tid, ok=bad is None, seconds=secs, cmds=[g["cmd"] for g in gates],

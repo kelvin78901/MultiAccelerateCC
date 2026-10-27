@@ -823,6 +823,16 @@ async def test_serial_points_share_and_bottleneck(repo):
     assert ("serial_bottleneck", "r") not in events            # r finished within 3x its estimate
 
 
+async def test_serial_task_gate_time_counts_as_serial(repo):
+    # REA #6404 round 4: integrate's worker ran ~6 min, then its done_when (verify:ghidra etc.) ~5.5 min with
+    # everything waiting; only the worker part was counted, so a fully serial run was reported as 57%
+    tasks = [Task("c", "c", kind=Kind.CONTRACT.value, owns=["api/**"], done_when=["sleep 0.4"]),
+             Task("r", "r", kind=Kind.REVIEW.value, deps=["c"], owns=["docs/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks)
+    worker_s = sum(u["seconds"] for u in store._conn.execute("SELECT seconds FROM usage").fetchall())
+    assert summary["serial"]["seconds"] >= worker_s + 0.39
+
+
 async def test_independent_tasks_are_not_serial_points(repo):
     tasks = [Task("x", "x", owns=["x/**"]), Task("y", "y", owns=["y/**"])]
     s, store, g, worker, events, summary = await run(repo, tasks, max_parallel=2)

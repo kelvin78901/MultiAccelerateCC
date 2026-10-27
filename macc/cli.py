@@ -47,7 +47,8 @@ def _print_event(type_: str, tid, payload: dict) -> None:
 
 
 # config keys that belong to the repository, not to a plan
-REPO_KEYS = ("history_dbs", "gate_baseline_s", "gate_timeout", "worktree_setup", "integration_gates")
+REPO_KEYS = ("history_dbs", "gate_baseline_s", "gate_timeout", "worktree_setup", "integration_gates",
+             "flake_check_runs")   # flake check is pytest-only: a repo setting
 
 
 def cmd_init(a) -> int:

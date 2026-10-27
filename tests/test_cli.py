@@ -225,3 +225,15 @@ def test_plan_from_prediction_keeps_repo_keys(repo_dir, tmp_path, monkeypatch, c
     assert main(["--repo", r, "plan", "--from", "todo app", "--worker", "mock", str(tmp_path / "p.yaml")]) == 0
     assert seen["history_dbs"] == [str(other.resolve())] and seen["gate_baseline_s"] == 8
     assert seen["max_parallel"] == 3                     # plan keys still come from the planner
+
+
+def test_flake_check_off_survives_plan_load(repo_dir, tmp_path):
+    import json
+    r = str(repo_dir)
+    assert main(["--repo", r, "init"]) == 0
+    cfgp = repo_dir / ".macc" / "config.json"
+    cfgp.write_text(json.dumps({**json.loads(cfgp.read_text()), "flake_check_runs": 0}))   # a vitest repo
+    plan = tmp_path / "p.yaml"
+    plan.write_text("config:\n  max_parallel: 2\ntasks:\n  - id: t\n    title: t\n    owns: ['t/**']\n")
+    assert main(["--repo", r, "plan", str(plan)]) == 0
+    assert json.loads(cfgp.read_text())["flake_check_runs"] == 0

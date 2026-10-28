@@ -273,7 +273,9 @@ def tests_mentioning(workdir: Path, tracked: Iterable[str], idents: set[str], ch
         named = {i for i in found if per[i] <= MAX_TEST_HITS_PER_IDENT}
         if not named or f in first:
             continue
-        score = sum(3.0 if _UPPER_SNAKE.fullmatch(i) else 1.0 / per[i] ** 0.5 for i in named)
-        score += len(_path_tokens([f]) & near)
+        # the rarest match decides; more matches add a little (bench D v0.4.0 plan: a test naming set_comment, in 4
+        # test files, must beat Java probes that each name several mid-frequency API symbols)
+        weights = sorted((3.0 if _UPPER_SNAKE.fullmatch(i) else 1.0 / per[i] ** 0.5 for i in named), reverse=True)
+        score = weights[0] + 0.25 * sum(weights[1:]) + len(_path_tokens([f]) & near)
         scored.append((-score, f))
     return (first + [f for _, f in sorted(scored)])[:limit]

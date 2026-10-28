@@ -49,7 +49,7 @@ def _print_event(type_: str, tid, payload: dict) -> None:
 
 # config keys that belong to the repository, not to a plan
 REPO_KEYS = ("history_dbs", "gate_baseline_s", "gate_timeout", "worktree_setup", "integration_gates",
-             "flake_check_runs", "focused_test_cmd")   # flake check is pytest-only: a repo setting
+             "flake_check_runs", "focused_test_cmd", "test_cmd_patterns")   # flake check is pytest-only: a repo setting
 
 
 def cmd_init(a) -> int:
@@ -231,6 +231,19 @@ def cmd_plan(a) -> int:
         print("usage: macc plan PLAN.yaml | macc plan --from 'description' [PLAN.yaml]", file=sys.stderr)
         return 2
     g, cfg = load_plan(a.plan)
+    # done_when is derived by the program; the planner's commands are suggestions (bench #6404 D v0.4.1-v0.4.3)
+    from .donewhen import derive_done_when, discovered_commands
+    repo_cfg = json.loads((repo.macc_dir / "config.json").read_text()) if (repo.macc_dir / "config.json").exists() else {}
+    ipath = repo.ensure_integration()
+    rewrites, notes = derive_done_when(g, {**repo_cfg, **cfg}, store.command_seconds(),
+                                       discovered_commands(repo.macc_dir),
+                                       repo.git("ls-files", cwd=ipath).stdout.split(), ipath)
+    for line in notes:
+        print(("WARNING: " if line.startswith("dropped") else "note: ") + line)
+    if rewrites:
+        store.event("done_when_derived", None, tasks={r.task: {"kept": r.kept, "derived": r.derived,
+                                                               "dropped": r.dropped, "moved": r.moved}
+                                                      for r in rewrites})
     existing = store.load_graph()
     # keep runtime state for tasks that already exist and whose spec did not change
     for t in g.tasks.values():
@@ -260,8 +273,9 @@ def cmd_plan(a) -> int:
     cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
-    from .planner import end_to_end_gates
-    for w in end_to_end_gates(g, cfg.get("integration_gates"), store.command_seconds()):
+    from .planner import contract_error_conventions, end_to_end_gates
+    for w in end_to_end_gates(g, cfg.get("integration_gates"), store.command_seconds()) + \
+            contract_error_conventions(g):
         print(f"WARNING: {w}")
     from .ownership import gap_warnings, ownership_gaps
     ipath = repo.ensure_integration()

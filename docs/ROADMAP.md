@@ -305,6 +305,13 @@ measured >= 60 s commands; the cost model adds measured done_when time), and `in
       (b) 10 self-made multi-component tasks with oracle tests.
 - [ ] Report: solve rate, wall-clock, Cost/Task, Cost/Submission, human interventions.
 
+## v0.4.4 — done_when owned by the program (done)
+From the #6404 bench lesson that every failed macc run came from planner-written done_when. `test_cmd_patterns`
++ the gate whitelist rewrite done_when at `macc plan`; contract error-convention check (fires on all four bench D
+plans, each missing error message wording, the v0.4.3 failure); nearby exports in the context pack. Replay
+(`~/bench/replay_v044.py`): verify:ghidra moved off the worker task in D v0.4.2 and v0.4.3; ghidraRoutingMcp.test.ts
+covered by integrate's derived done_when in D v0.4.0. No live run.
+
 ## Lessons
 
 ### REA #6404 bench (2026-10-27): single session vs subagents vs agent team vs macc

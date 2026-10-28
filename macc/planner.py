@@ -37,7 +37,10 @@ Inspect the repository (read-only) as needed before planning.
 3. Unknowns become spikes. If something might not work (hardware, a library, performance), add a
    `kind: spike` task whose output is a conclusion document, and make dependent tasks depend on it.
 4. Every code task has `done_when`: shell commands (exit 0 = done) that prove it, e.g. a targeted test
-   command. Prefer tests that exist or that the task itself creates.
+   command. Prefer tests that exist or that the task itself creates. Your done_when is a suggestion: when the
+   repository configures test-command patterns, macc derives each code task's done_when from the test files the
+   task owns plus whitelisted gates, drops commands that are not on the whitelist, and runs slow end-to-end
+   checks only in integrate. So put every test file a task creates or must update into its `owns` by path.
 5. Stubs are allowed only where a task says `allow_stubs: true`; the final `kind: integrate` task
    must resolve all debts. End with a `kind: review` task depending on integrate.
 6. est_minutes is expected worker minutes (use the measured history below, not human time). Split a
@@ -71,6 +74,9 @@ Inspect the repository (read-only) as needed before planning.
     other files that list or assert on it: verifiers, inventories, catalogs, docs that count operations.
     Each such file that the change affects must be owned by a task (usually integrate) whose spec names it.
     An unowned file that breaks can only be fixed by a human.
+15. Cross-task observable behaviour belongs in the contract: error codes, error message text (and which side
+    owns it), return value vs throw. When one task implements behaviour and another task tests or verifies it,
+    the contract spec must state these, or the two sides will disagree.
 
 # Output
 Emit exactly one YAML document between the markers, nothing else after it:
@@ -197,6 +203,45 @@ def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: l
 
 
 HEAVY_E2E_S = 60.0
+
+
+# what a contract must pin down when one task implements behaviour that another task's tests or verifiers observe
+_CONVENTIONS = {
+    "error codes": re.compile(r"error[ _-]?codes?|error kinds?|\bkind\b|\bcode\b|[a-z]+_(?:request|error|unavailable|"
+                              r"failure)\b", re.I),
+    "return value vs throw": re.compile(r"\breturns?\s+(?:`?(?:false|true|null|none|undefined)`?|an? )|\bthrows?\b|"
+                                        r"\brejects?\b|\braises?\b|return value", re.I),
+    "error message wording": re.compile(r"\bmessages?\b|wording|error text|exact text|phrasing", re.I),
+}
+_VERIFY_PATH = re.compile(r"(^|/)tests?/|\.test\.|\.spec\.|(^|/)test_[^/]*\.py$|_test\.(py|go)$|(^|/)scripts/[^/]*verif",
+                          re.I)
+
+
+def _is_verify_path(p: str) -> bool:
+    return bool(_VERIFY_PATH.search(p))
+
+
+def contract_error_conventions(g: TaskGraph) -> list[str]:
+    """Warn when one task implements behaviour and a different task tests or verifies it, but no contract spec fixes
+    the cross-task conventions (bench #6404 D v0.4.3: a verifier task asserted "contains unpaired Unicode surrogate"
+    while the bridge task wrote "contains an unpaired ...", and the review round could not converge)."""
+    code = [t for t in g.tasks.values() if t.kind == Kind.CODE.value]
+    impl = [t for t in code if any(not _is_verify_path(o) and not o.startswith("docs/") for o in t.owns)]
+    verify = [t for t in code if t.owns and all(_is_verify_path(o) for o in t.owns)]
+    if not impl or not verify or not any(v.id != i.id for v in verify for i in impl):
+        return []
+    contracts = [t for t in g.tasks.values() if t.kind == Kind.CONTRACT.value]
+    pair = f"{impl[0].id} implements, {verify[0].id} tests/verifies"
+    if not contracts:
+        return [f"no contract task, but {pair}: cross-task behaviour (error codes, error messages, return value vs "
+                "throw) has no single owner"]
+    text = "\n".join(t.spec for t in contracts)
+    missing = [name for name, rx in _CONVENTIONS.items() if not rx.search(text)]
+    if not missing:
+        return []
+    return [f"contract {', '.join(t.id for t in contracts)} does not fix {', '.join(missing)}, but {pair}: write "
+            "the observable error behaviour into the contract (error codes, who owns the error text, return value "
+            "vs throw) so the two sides cannot disagree"]
 
 
 def end_to_end_gates(g: TaskGraph, gates: list[str] | None = None,
@@ -438,6 +483,7 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
         cfg = (data.get("config") or {}) if isinstance(data, dict) else {}
         warns = plan_warnings(g, set(files), cfg.get("integration_gates"))
         warns += end_to_end_gates(g, cfg.get("integration_gates"), command_s)
+        warns += contract_error_conventions(g)
         from .ownership import gap_warnings, ownership_gaps
         warns += gap_warnings(ownership_gaps(g, workdir, files))
         return PlanResult(graph=g, warnings=warns, config=cfg, usage=usage)

@@ -346,7 +346,7 @@ class Scheduler:
         head = self.repo.head(self.repo.integration_path) if t.kind == Kind.REVIEW.value else None
         tree = self.repo.tree(self.repo.integration_path) if head else None
         pack = build_context_pack(t, self.graph, self.store, self.cfg.project_rules, integration_head=head,
-                                  integration_tree=tree, gate_cmds=list(self.cfg.integration_gates))
+                                  integration_tree=tree, gate_cmds=list(self.cfg.integration_gates), workdir=wt)
         run_as = t
         if t.kind == Kind.REVIEW.value:
             facts, run_as = self._review_setup(t, head)

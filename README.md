@@ -20,7 +20,7 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.4.3)
+## What it does today (v0.4.4)
 
 Scheduling
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other; priority by critical path.
@@ -45,6 +45,17 @@ Planning
   owner (`macc plan PLAN.yaml --gaps` lists all). A file covered only by integrate's wildcard owns (`tests/**`)
   and named by no spec counts as a gap too: a broad glob gives permission, not attention. The planner prompt has
   the same rule.
+
+- **done_when is derived, not trusted (v0.4.4)**: with `test_cmd_patterns` in `.macc/config.json`
+  (e.g. `{"cmd": "npm run test:focused -- {files}", "paths": ["tests/**"]}`, `"node --check {file}"`), `macc plan`
+  rewrites each code task's done_when from the test files it owns plus whitelisted commands (integration gates,
+  `--discover-gates` results, the patterns on exact files). Other planner commands are dropped (`dropped: ...`);
+  a non-gate command measured >= 60 s is moved to integrate. Integrate also gets the owned test files that mention
+  identifiers the specs name. Event `done_when_derived`.
+- **Contract error conventions (v0.4.4)**: when one task implements behaviour and another tests or verifies it,
+  the contract spec must fix error codes, error message wording and return value vs throw; otherwise a warning.
+- **Nearby exports (v0.4.4)**: the context pack lists up to 60 `file: exports` lines from the directories of the
+  task's owns, `tests/` beside them and the shared test helper directories, so workers reuse existing harnesses.
 
 Gates
 - **Gate discovery**: `macc init --discover-gates` times the repo's own check/lint/format/typecheck/test targets

@@ -283,7 +283,7 @@ def scheduler_checks(task: Task, store: Store, gate_cmds: list[str]) -> str:
 
 def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules: str = "",
                        integration_head: Optional[str] = None, integration_tree: Optional[str] = None,
-                       gate_cmds: list[str] = ()) -> str:
+                       gate_cmds: list[str] = (), workdir: Optional[Path] = None) -> str:
     """The *only* thing a worker reads besides the repo itself. Short, stable prefix first (cacheable),
     task-specific material last."""
     parts: list[str] = []
@@ -337,6 +337,12 @@ def build_context_pack(task: Task, graph: TaskGraph, store: Store, project_rules
         parts.append("# Open debts touching your inputs\n" + "\n".join(
             f"- [{x['kind']}] {x['path'] or ''} {x['note']}" for x in mine[:15]))
 
+    if workdir is not None and task.owns:
+        from .exports import nearby_exports
+        near = nearby_exports(task.owns, Path(workdir))
+        if near:
+            parts.append("# Existing exports next to your files (reuse these before writing new helpers)\n"
+                         + "\n".join(f"- {line}" for line in near))
     parts.append(
         f"# Your task: {task.id} — {task.title}\n"
         f"kind: {task.kind}\n"

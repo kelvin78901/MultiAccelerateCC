@@ -5,4 +5,4 @@ functions (write a spec, write code, review a diff). Every decision about
 *what runs next, when, and whether something is stale* is made by the graph.
 """
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"

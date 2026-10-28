@@ -305,6 +305,49 @@ measured >= 60 s commands; the cost model adds measured done_when time), and `in
       (b) 10 self-made multi-component tasks with oracle tests.
 - [ ] Report: solve rate, wall-clock, Cost/Task, Cost/Submission, human interventions.
 
+## Lessons
+
+### REA #6404 bench (2026-10-27): single session vs subagents vs agent team vs macc
+One run per arm, Opus, $25 cap, same `task.md` (issue verbatim + acceptance criteria), baseline-only clones, scored
+by `~/bench/score.sh` (11 gates, real verify:ghidra, a 60-case oracle written by a separate session, 90 related
+test files, out-of-bounds check) and a blind five-way review (8 items, max 40). Data: `~/bench/results/final/`.
+
+| arm | finished | wall s | cost $ | oracle | regressions | blind |
+|---|---|---|---|---|---|---|
+| A single session | yes | 749 | 3.89 | 60/60 | 0 | 31 |
+| B background subagents | yes | 1029 | 7.61 | 60/60 | 0 | 33 |
+| C agent team | yes | 721 | 6.27 | 58/60 | 0 | 32 |
+| D macc v0.4.0 | yes | 1543 | 7.97 | 60/60 | 1 | 25 |
+| D macc v0.4.1 | no | 947 | 5.44 | 59/60 | 8 | - |
+| D macc v0.4.2 | no | 1461 | 6.52 | 24/60 | 1 | - |
+| D macc v0.4.3 | no | 2680 | 13.49 | 56/60 | 0 | 28 |
+
+1. **This task had no parallel room; macc's fixed cost was pure loss.** One short dependency chain plus a 4-minute
+   real-Ghidra check that only runs serially. D v0.4.0: planner 378 s, contract 64 s, six code workers 387 s of work
+   in 185 s of wall, integrate 747 s (worker 404 s + 343 s of done_when/gates), review 163 s. Parallelism saved
+   ~200 s; the planner and the serial integrate/review cost ~1290 s.
+2. **A clear acceptance spec did what the ownership mechanisms were built for.** All four arms updated all three
+   verifiers that enumerate Ghidra operations without being told their names; the original #6404 macc run needed
+   three extra rounds to find them.
+3. **Root cause of every D failure: the planner writes done_when freely.** v0.4.1: a directory passed to
+   `test:focused` (REA rejects it; rules.md said so, the planner did not see rules.md). v0.4.2: the bridge task got
+   `verify:ghidra`, an end-to-end check that cannot pass before other tasks merge. v0.4.3: the v0.4.3 plan-time
+   warning fired on exactly that pattern (`real_verifier: npm run verify:ghidra`, measured 260 s) and the run still
+   failed there: after a review REJECT the task's own new assertion disagreed with another task's error text inside
+   verify:ghidra, and the retry changed nothing. Warnings without a human to act on them change nothing; each fix
+   closed one hole and the next run found another. Next step is not another warning: macc should own done_when
+   (derive targeted checks from owns and the repo's test command; reserve end-to-end checks for integrate) and
+   treat planner-written commands as suggestions.
+4. **Diff size was plan-driven, not duplicated work.** D v0.4.0 +926 vs A +421: same production code size; the
+   excess is a 35-line wire-rules JSDoc the contract task wrote into GhidraInventoryValues.ts, a fake Ghidra that
+   re-implements the bridge's validation because the plan told it to follow that JSDoc, and a new 363-line MCP
+   test with a hand-rolled 107-line harness where the existing `connectGhidraMcp` would do (A used it: +60 lines).
+5. **Derived tests (v0.4.1) work but caught nothing in a real run.** v0.4.3: 40 files from 143 changed
+   identifiers, 58 s, all green (the plan already owned the routing test). On v0.4.0's final tree the same rule
+   catches the one regression (ghidraRoutingMcp, 75 s).
+6. **The oracle saturates; the blind review and the oracle agree where they overlap** (D v0.4.3: unmapped address
+   throws instead of returning false, found by both).
+
 ## Later
 - Multi-model routing (cheap model for low-risk kinds).
 - Remote workers (Claude Code on the web / other machines) through the same WorkerFn interface.

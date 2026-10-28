@@ -190,3 +190,45 @@ async def test_planner_gets_a_tree_digest_and_repo_guides(tmp_path):
 
     await generate_plan("feature", tmp_path, Spy2(), tmp_path / "q.yaml", existing_files=["a.py", "b.py"])
     assert "- a.py\n- b.py" in small[0]
+
+
+async def test_generate_plan_prompt_carries_project_rules(tmp_path):
+    # bench #6404 D re-run: rules.md said "never a directory" for test:focused, but only workers saw it; the
+    # planner put a directory into two done_when commands and the run failed
+    seen = []
+
+    class Spy(MockWorker):
+        async def __call__(self, task, wt, pack):
+            seen.append(pack)
+            return await super().__call__(task, wt, pack)
+
+    rules = "- Tests: `npm run test:focused -- <file>...` takes exact files, never a directory."
+    await generate_plan("feature", tmp_path, Spy(), tmp_path / "p.yaml", project_rules=rules)
+    assert "# Project rules (.macc/rules.md" in seen[0] and rules in seen[0]
+    await generate_plan("feature", tmp_path, Spy(), tmp_path / "q.yaml")
+    assert "# Project rules (.macc/rules.md" in seen[1] and "(none)" in seen[1]
+
+
+def test_plan_from_passes_rules_md_to_the_planner(tmp_path, monkeypatch, capsys):
+    import subprocess
+    import macc.planner as planner
+    from macc.cli import main
+    root = tmp_path / "r"
+    root.mkdir()
+    for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=root, check=True)
+    (root / "README.md").write_text("x\n")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=root, check=True)
+    assert main(["--repo", str(root), "init"]) == 0
+    (root / ".macc" / "rules.md").write_text("- RULE-FOR-THE-PLANNER\n")
+    got = {}
+    real = planner.generate_plan
+
+    async def spy(*a, **kw):
+        got.update(kw)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(planner, "generate_plan", spy)
+    assert main(["--repo", str(root), "plan", "--from", "feature", "--worker", "mock", str(tmp_path / "p.yaml")]) == 0
+    assert "RULE-FOR-THE-PLANNER" in got["project_rules"]

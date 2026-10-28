@@ -121,6 +121,10 @@ Rules for commands in `done_when` / `integration_gates`:
   owned paths are committed); guard with `git diff --quiet $MACC_BASE -- <paths>` only for paths that no
   task in the plan owns.
 
+# Project rules (.macc/rules.md: prepended to every worker's context; your done_when and integration_gates
+# commands must obey them too, e.g. which test commands take which arguments)
+{RULES}
+
 # Repository guides (workers follow these; plan tasks that respect them)
 {GUIDES}
 
@@ -368,7 +372,7 @@ class PlanResult:
 async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: Path,
                         effort: str = "high", model: Optional[str] = None, max_rounds: int = 2,
                         existing_files: Optional[list[str]] = None, current_gate: str = "",
-                        history: Optional[dict] = None) -> PlanResult:
+                        history: Optional[dict] = None, project_rules: str = "") -> PlanResult:
     """Call the planner worker inside `workdir` (the integration worktree, where workers will run);
     on validation failure feed the error back once. Returns the graph plus non-fatal warnings."""
     files = existing_files if existing_files is not None else sorted(
@@ -378,6 +382,7 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
         else tree_digest(files)
     prompt = (PLANNER_PROMPT.replace("{BEGIN}", PLAN_BEGIN).replace("{END}", PLAN_END)
               .replace("{DESCRIPTION}", description).replace("{FILES}", listing)
+              .replace("{RULES}", project_rules.strip() or "(none)")
               .replace("{GUIDES}", repo_guides(workdir))
               .replace("{GATE}", current_gate or "(none configured)")
               .replace("{HISTORY}", format_history(history)))

@@ -20,7 +20,7 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.4.1)
+## What it does today (v0.4.2)
 
 Scheduling
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other; priority by critical path.
@@ -35,7 +35,8 @@ Scheduling
 Planning
 - **Planner in one call**: `macc plan --from "..."` inspects the repo read-only and emits plan YAML; the program
   validates it (cycles, contract limits, ownership overlap, missing done_when, impossible guards, review asking
-  for the full suite) and you review the file before `macc plan PLAN.yaml`.
+  for the full suite) and you review the file before `macc plan PLAN.yaml`. The planner sees `.macc/rules.md` as
+  well as AGENTS.md / CONTRIBUTING.md / CLAUDE.md, so its done_when commands follow the same rules as workers (v0.4.2).
 - **Ownership gaps (v0.4)**: identifiers the contract/code specs name (UPPER_SNAKE constants, camelCase /
   PascalCase symbols, snake_case operation names) are grepped in `scripts/`, `tests/`, `docs/` and `src/**/*.test.*`;
   files that mention them but that no task owns are listed, most likely first, with integrate as the suggested

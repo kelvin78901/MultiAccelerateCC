@@ -184,7 +184,7 @@ def cmd_plan(a) -> int:
         repo.gate_timeout = int(cfg_now.get("gate_timeout", 1800))
         pr = asyncio.run(generate_plan(a.from_desc, ipath, worker, out, effort=a.effort, model=a.model,
                                        existing_files=existing, current_gate=gate_now,
-                                       history=store.history_by_kind()))
+                                       history=store.history_by_kind(), project_rules=_rules(repo)))
         g = pr.graph
         for i, u in enumerate(pr.usage, 1):
             store.add_usage("_plan", i, getattr(worker, "name", "worker"), u.ok, model=u.model,

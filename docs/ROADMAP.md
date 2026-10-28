@@ -429,6 +429,32 @@ Two defects the last run exposed, recorded and not fixed (REA experiments ended 
   v0.4.4's derivation as exact owned files) cannot pass there. Bench 2 D v0.4.5: tests_info_plist,
   tests_localizations and tests_privacy_manifests each failed both attempts this way.
 
+### Negative result: "use the build wait" has no premise on an Android project (2026-10-28)
+Step 0 of a planned experiment on whether parallel workers can absorb build/test wait, before any arm ran.
+Project: a single-module Android app (Kotlin + Compose, AGP 8.9.1, Gradle 8.11.1, JDK 21), independent clones at
+HEAD. Warm-daemon build times (second of two runs): clean assembleDebug 9.0 s, incremental assembleDebug 1.2 s
+(leaf file) / 3.3 s (the 4496-line MainActivity), edit + testDebugUnitTest 1.1 s, full lint 9.7 s, first lint in a
+new project directory 31.8 s, emulator boot 30 s + connectedDebugAndroidTest 33 s. Every candidate surface's minimal
+check (filtered unit test after an edit) took 0.8-1.1 s.
+
+Wait share of one default `claude -p` session (Opus, transcript timestamps: Bash tool_use -> tool_result):
+
+| task | wall s | cost $ | Bash s (share) | Gradle calls | Gradle s (share) |
+|---|---|---|---|---|---|
+| History export (1 surface) | 122 | 1.03 | 36.7 (30.1%) | 2 | 31.6 (25.9%) |
+| C1: 3 independent surfaces | 258 | 1.38 | 45.0 (17.5%) | 3 | 43.8 (17.0%) |
+
+C1's Gradle calls: 5.4 s (testDebugUnitTest after writing a test file), 29.7 s (first assembleDebug +
+testDebugUnitTest + lintDebug in the fresh clone), 8.7 s (final re-check). Both runs verified independently
+(build and tests pass, no new lint errors).
+
+So the build wait is 17-26% of a single session, which caps what overlapping it could recover at under a fifth of
+wall time, and each extra worktree pays a ~30 s first build of its own (most of the wait measured above is exactly
+that first build). The bigger task added model time, not build time: the agent batched edits and ran Gradle three
+times. The hypothesis has no premise on this project; parallelism could only help by splitting model time
+(83% of C1). The task estimates were also off by ~10x (C1 was planned as 30-60 min, took 4.4 min). Material:
+`bench/android/`.
+
 ## Later
 - Multi-model routing (cheap model for low-risk kinds).
 - Remote workers (Claude Code on the web / other machines) through the same WorkerFn interface.

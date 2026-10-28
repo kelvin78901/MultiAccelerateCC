@@ -1,8 +1,12 @@
 # MultiAccelerateCC
 
-## Project status: experimental, not recommended for real tasks
+## Project status: Archived
 
-The current version (v0.4.5) is not recommended for real work. In two benchmarks on a real repository (REA) it
+Archived after two REA benchmarks and an Android step 0: on tasks that fit in a single context it was not faster
+than one Claude Code session, cost 1.5-2x as much and did not reach acceptable reliability; the boundary for very
+large tasks was not tested and will not be pursued. The results below are kept for reference.
+
+In two benchmarks on a real repository (REA) it
 was compared with a single Claude Code session (A), background subagents (B) and an agent team (C), all on Opus
 with the same task text. Oracle = hidden acceptance cases passed; blind = independent review score out of 40.
 

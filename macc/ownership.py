@@ -70,7 +70,14 @@ def ownership_gaps(g: TaskGraph, workdir: Path, files: Iterable[str]) -> list[di
     idents -= set(g.tasks)
     if not idents:
         return []
-    all_owns = [o for t in g.tasks.values() for o in t.owns]
+    # covered = owned by a contract/code task, named in some spec, or listed by path (no wildcard) in integrate's
+    # owns. Integrate's broad globs (`tests/**`) give permission, not attention: bench D left a test that used
+    # set_comment as its "unavailable" example unchanged, owned by `tests/**` and named by no spec.
+    worker_owns = [o for t in g.tasks.values() if t.kind != Kind.INTEGRATE.value for o in t.owns]
+    integ = [t for t in g.tasks.values() if t.kind == Kind.INTEGRATE.value]
+    integ_exact = [o for t in integ for o in t.owns if not any(c in o for c in "*?[")]
+    integ_globs = [o for t in integ for o in t.owns if any(c in o for c in "*?[")]
+    specs = "\n".join(t.spec for t in g.tasks.values())
     word = re.compile(r"\b(" + "|".join(sorted(map(re.escape, idents), key=len, reverse=True)) + r")\b")
     hits: dict[str, set[str]] = {}
     per_ident: dict[str, int] = {}
@@ -86,7 +93,7 @@ def ownership_gaps(g: TaskGraph, workdir: Path, files: Iterable[str]) -> list[di
             continue
         for i in found:
             per_ident[i] = per_ident.get(i, 0) + 1
-        if found and not _owned(f, all_owns):
+        if found and not (_owned(f, worker_owns) or _owned(f, integ_exact) or f in specs):
             hits[f] = found
     generic = {i for i, n in per_ident.items() if n > MAX_HITS_PER_IDENT}
     owner = suggest_owner(g)
@@ -102,7 +109,9 @@ def ownership_gaps(g: TaskGraph, workdir: Path, files: Iterable[str]) -> list[di
         score = sum(3.0 if _UPPER_SNAKE.fullmatch(i) else 1.0 / per_ident[i] ** 0.5 for i in named)
         near = sorted(_path_tokens([f]) & affinity)
         score += 1.0 * len(near)
-        out.append({"file": f, "idents": named, "suggest": owner, "score": round(score, 2), "near": near})
+        via = next((o for o in integ_globs if _owned(f, [o])), None)
+        out.append({"file": f, "idents": named, "suggest": owner, "score": round(score, 2), "near": near,
+                    "via": via})
     out.sort(key=lambda x: (-x["score"], x["file"]))
     return out
 
@@ -125,11 +134,13 @@ def _path_tokens(paths: Iterable[str]) -> set[str]:
 def gap_warnings(gaps: list[dict], limit: int = 12) -> list[str]:
     if not gaps:
         return []
-    lines = [f"{len(gaps)} file(s) nobody owns mention identifiers this plan's specs name; if the change alters "
-             f"them, these break with no task allowed to fix them. Add them to {gaps[0]['suggest']}'s owns (and a spec "
-             "line) or confirm they are unaffected. Most likely first:"]
+    lines = [f"{len(gaps)} file(s) no task is pointed at mention identifiers this plan's specs name: nobody owns them, "
+             "or only integrate's broad glob does and no spec names them. If the change alters them, they break "
+             f"unnoticed. Name them in {gaps[0]['suggest']}'s owns and spec, or confirm they are unaffected. "
+             "Most likely first:"]
     for gp in gaps[:limit]:
-        lines.append(f"  {gp['file']}: {', '.join(gp['idents'][:5])}{' ...' if len(gp['idents']) > 5 else ''}")
+        via = f" [only via {gp['via']!r}]" if gp.get("via") else ""
+        lines.append(f"  {gp['file']}: {', '.join(gp['idents'][:5])}{' ...' if len(gp['idents']) > 5 else ''}{via}")
     if len(gaps) > limit:
         lines.append(f"  ... {len(gaps) - limit} weaker matches (`macc plan --gaps` lists all)")
     return ["\n".join(lines)]
@@ -176,3 +187,61 @@ def outside_owns(output: str, tracked: set[str], owns: list[str]) -> list[str]:
     if files and not any(_owned(f, owns) for f in files):
         return files
     return []
+
+
+# ------------------------------------------------------------------ integrate: tests that mention what changed
+TEST_FILE = re.compile(r"(\.test\.|\.spec\.)[^/]+$|(^|/)test_[^/]+\.py$|_test\.(py|go)$")
+MAX_DERIVED_TESTS = 40
+MAX_TEST_HITS_PER_IDENT = 30
+
+
+def changed_identifiers(diff: str) -> tuple[set[str], list[str]]:
+    """(identifiers on added/removed lines of non-test files, every changed path) from a unified diff."""
+    idents: set[str] = set()
+    paths: list[str] = []
+    current = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            current = line.split(" b/", 1)[-1]
+            paths.append(current)
+        elif line.startswith(("+++", "---")):
+            continue
+        elif line[:1] in "+-" and current and not TEST_FILE.search(current):
+            idents |= spec_identifiers(line[1:])
+    return idents, paths
+
+
+def tests_mentioning(workdir: Path, tracked: Iterable[str], idents: set[str], changed: list[str],
+                     limit: int = MAX_DERIVED_TESTS) -> list[str]:
+    """Test files to run for a change: the changed ones first, then tracked test files that mention a changed
+    identifier, most specific first (a rare identifier, a path near the changed files). Identifiers found in more
+    than MAX_TEST_HITS_PER_IDENT test files are too generic to select by."""
+    tests = [f for f in tracked if TEST_FILE.search(f) and (workdir / f).is_file()]
+    first = [f for f in changed if f in set(tests)]
+    if not idents:
+        return first[:limit]
+    word = re.compile(r"\b(" + "|".join(sorted(map(re.escape, idents), key=len, reverse=True)) + r")\b")
+    hits: dict[str, set[str]] = {}
+    per: dict[str, int] = {}
+    for f in tests:
+        try:
+            p = workdir / f
+            if p.stat().st_size > MAX_FILE_BYTES:
+                continue
+            found = set(word.findall(p.read_text(errors="replace")))
+        except OSError:
+            continue
+        if found:
+            hits[f] = found
+            for i in found:
+                per[i] = per.get(i, 0) + 1
+    near = _path_tokens(changed)
+    scored = []
+    for f, found in hits.items():
+        named = {i for i in found if per[i] <= MAX_TEST_HITS_PER_IDENT}
+        if not named or f in first:
+            continue
+        score = sum(3.0 if _UPPER_SNAKE.fullmatch(i) else 1.0 / per[i] ** 0.5 for i in named)
+        score += len(_path_tokens([f]) & near)
+        scored.append((-score, f))
+    return (first + [f for _, f in sorted(scored)])[:limit]

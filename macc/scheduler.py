@@ -55,6 +55,9 @@ class SchedulerConfig:
     gate_timeout: int = 1800                     # seconds per gate command
     history_dbs: list[str] = field(default_factory=list)   # other repos' state.db: worker history for the cost model
     gate_baseline_s: Optional[float] = None      # this repo's gate time measured by `macc init --gate`
+    # integrate also runs the test files that mention identifiers its diff changed: "{files}" is replaced by them
+    # (REA: "npm run test:focused -- {files}"; pytest: "python -m pytest -q {files}"). Empty: off.
+    focused_test_cmd: str = ""
     review_low_model: str = "sonnet"
     review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
@@ -239,6 +242,13 @@ class Scheduler:
         gates = [] if reuse else [{"cmd": c, "ok": True} for c in self.cfg.integration_gates]
         own = self.repo.run_gates(t.done_when) if t.done_when else []
         if not all(g["ok"] for g in own):
+            return False
+        derived = self._derived_tests(t, self.repo.integration_path)
+        own += derived
+        if derived and not derived[0]["ok"]:     # the worker runs and sees which existing tests the change broke
+            t.last_error = (f"tests that mention identifiers this change touched fail: {derived[0]['cmd']}\n"
+                            f"{clip_output(derived[0]['stderr'], 700, 1500)}{clip_output(derived[0]['stdout'], 700, 1500)}")
+            self._persist(t.id)
             return False
         flaky = self._flake_check(t.id)
         if flaky:                             # the integrate worker runs, told which test is order/seed dependent
@@ -479,6 +489,8 @@ class Scheduler:
 
         # 2. task-level gates (done_when) inside the worktree
         gates = await asyncio.to_thread(self.repo.run_gates, t.done_when, wt) if t.done_when else []
+        if t.kind == Kind.INTEGRATE.value and all(g["ok"] for g in gates):
+            gates += await asyncio.to_thread(self._derived_tests, t, wt)
         if tid in self._serial_points:   # everything still waits while a serial task's gates run (REA: 330 s)
             self.serial_seconds += sum(g.get("seconds", 0.0) for g in gates if not g.get("shared"))
         if gates and not all(g["ok"] for g in gates):
@@ -791,6 +803,31 @@ class Scheduler:
         self._persist(*reviewed, *between)
         self.emit("review_rejected", review.id, reviewed=reviewed, round=review.attempts, held=between)
         self._fail(review, "review rejected: " + notes[:1500])   # PENDING until max_attempts, then FAILED
+
+    def _derived_tests(self, t: Task, where) -> list[dict]:
+        """Integrate's extra gate: the test files that mention identifiers changed since the base (bench #6404 D: a
+        routing test used set_comment as its "unavailable" example; no spec named it, no gate ran it, review passed)."""
+        if not self.cfg.focused_test_cmd:
+            return []
+        import shlex
+        from .ownership import changed_identifiers, tests_mentioning
+        base = self.cfg.plan_base or self.repo.macc_env().get("MACC_BASE")    # this plan's whole change
+        if not base:
+            return []
+        diff = self.repo.git("diff", base, "HEAD", cwd=where, check=False).stdout
+        idents, changed = changed_identifiers(diff)
+        tracked = self.repo.git("ls-files", cwd=where, check=False).stdout.split()
+        files = tests_mentioning(Path(where), tracked, idents, changed)
+        if not files:
+            return []
+        cmd = self.cfg.focused_test_cmd.replace("{files}", " ".join(shlex.quote(f) for f in files))
+        self.emit("derived_tests", t.id, files=files, idents=len(idents))
+        recs = self.repo.run_gates([cmd], where)
+        for r in recs:
+            r["derived"] = True
+        if t.id in self._serial_points:
+            self.serial_seconds += sum(r.get("seconds", 0.0) for r in recs)
+        return recs
 
     def _blocked_outside_owns(self, t: Task, bad: dict, where) -> bool:
         """A gate whose failure output points only at files the task does not own cannot be fixed by a retry

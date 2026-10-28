@@ -49,7 +49,7 @@ def _print_event(type_: str, tid, payload: dict) -> None:
 
 # config keys that belong to the repository, not to a plan
 REPO_KEYS = ("history_dbs", "gate_baseline_s", "gate_timeout", "worktree_setup", "integration_gates",
-             "flake_check_runs")   # flake check is pytest-only: a repo setting
+             "flake_check_runs", "focused_test_cmd")   # flake check is pytest-only: a repo setting
 
 
 def cmd_init(a) -> int:
@@ -64,6 +64,11 @@ def cmd_init(a) -> int:
         cfg["worktree_setup"] = a.setup
     if a.gate_timeout is not None:
         cfg["gate_timeout"] = a.gate_timeout
+    if a.focused_test_cmd is not None:
+        if a.focused_test_cmd and "{files}" not in a.focused_test_cmd:
+            print("ERROR: --focused-test-cmd needs a {files} placeholder")
+            return 2
+        cfg["focused_test_cmd"] = a.focused_test_cmd
     repo.gate_timeout = int(cfg.get("gate_timeout", 1800))
     setup_ok = True
     if cfg.get("worktree_setup"):                 # the gate below runs in the integration worktree: set it up first
@@ -465,6 +470,9 @@ def main(argv=None) -> int:
     sp.add_argument("--gate-timeout", type=int, default=None, help="seconds per gate command (config gate_timeout)")
     sp.add_argument("--gate-baseline", type=float, default=None,
                     help="record this gate time (s) instead of the measured one (e.g. the measured run hit a build cache)")
+    sp.add_argument("--focused-test-cmd", default=None, metavar="CMD",
+                    help="command that runs given test files, with a {files} placeholder; integrate then also runs "
+                         "the tests that mention identifiers its diff changed (empty string turns it off)")
     sp.add_argument("--discover-gates", action="store_true",
                     help="time the repo's check/lint/format/typecheck/test targets on the integration tree and list "
                          "those passing in under half of gate_timeout (saved to .macc/gate_discovery.json)")

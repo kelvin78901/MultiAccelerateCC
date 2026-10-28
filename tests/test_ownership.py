@@ -75,14 +75,16 @@ def test_ownership_gaps_lists_unowned_enumerations_most_likely_first(tmp_path):
     assert got.index("scripts/verify-ghidra-inventory.mjs") < got.index("scripts/hopper-basics.mjs")
     assert all(x["suggest"] == "integrate" for x in gaps)
     w = gap_warnings(gaps, limit=2)[0]
-    assert "5 file(s) nobody owns" in w and "integrate's owns" in w and "3 weaker matches" in w
+    assert "5 file(s) no task is pointed at" in w and "integrate's owns" in w and "3 weaker matches" in w
 
 
 def test_owned_files_and_generic_identifiers_are_not_gaps(tmp_path, monkeypatch):
     import macc.ownership as own
     root, files = _files(tmp_path)
     tracked = _git_repo(root, files)
-    assert ownership_gaps(_plan(owns_integrate=["scripts/**", "docs/**", "src/**"]), root, tracked) == []
+    worker = _plan(owns_integrate=["src/ghidra/inventory.ts"])
+    worker.tasks["impl"].owns += ["scripts/**", "docs/**", "src/**"]
+    assert ownership_gaps(worker, root, tracked) == []
     monkeypatch.setattr(own, "MAX_HITS_PER_IDENT", 2)      # set_comment (3 files) and the constant (2) ...
     gaps = ownership_gaps(_plan(owns_integrate=["src/ghidra/inventory.ts"]), root, tracked)
     assert all("set_comment" not in x["idents"] for x in gaps)
@@ -98,7 +100,7 @@ def test_plan_load_warns_about_gaps_and_records_them(tmp_path, capsys):
          "done_when": t.done_when} for t in _plan(owns_integrate=["src/ghidra/inventory.ts"]).tasks.values()]}))
     assert main(["--repo", str(root), "plan", str(plan)]) == 0
     out = capsys.readouterr().out
-    assert "WARNING: 5 file(s) nobody owns" in out and "scripts/verify-ghidra-windows.mjs" in out
+    assert "WARNING: 5 file(s) no task is pointed at" in out and "scripts/verify-ghidra-windows.mjs" in out
     ev = Store(root / ".macc" / "state.db").latest_event("ownership_gaps")
     assert "scripts/verify-ghidra-inventory.mjs" in ev["payload"]["files"] and ev["payload"]["suggest"] == "integrate"
     assert main(["--repo", str(root), "plan", str(plan), "--gaps"]) == 0
@@ -240,3 +242,89 @@ def test_context_pack_names_heavy_checks_the_worker_must_not_run(tmp_path):
     assert "['npm run check:fast', 'npm run format:check']" in pack
     light = Task("c", "c", done_when=["npm run check:fast"])
     assert "Do NOT run" not in build_context_pack(light, TaskGraph([light]), store)
+
+
+# ------------------------------------------------------------------ integrate's broad glob is not attention
+def test_integrate_only_glob_coverage_is_a_gap_but_named_files_are_not(tmp_path):
+    root, files = _files(tmp_path)
+    tracked = _git_repo(root, files)
+    g = _plan(owns_integrate=["src/ghidra/inventory.ts", "scripts/**", "docs/**", "src/**",
+                              "scripts/verify-ghidra-windows.mjs"])
+    g.tasks["integrate"].spec = "Also update docs/ghidra.md for the new count."
+    gaps = {x["file"]: x for x in ownership_gaps(g, root, tracked)}
+    # covered only by integrate's wildcards and named by no spec: still a gap, and the warning says why
+    assert gaps["scripts/verify-ghidra-inventory.mjs"]["via"] == "scripts/**"
+    assert gaps["src/ghidra/client.test.ts"]["via"] == "src/**"
+    assert "scripts/verify-ghidra-windows.mjs" not in gaps         # listed by path in integrate's owns
+    assert "docs/ghidra.md" not in gaps                            # named in a spec
+    assert "[only via 'scripts/**']" in gap_warnings(list(gaps.values()))[0]
+
+
+def test_changed_identifiers_come_from_changed_source_lines_only():
+    from macc.ownership import changed_identifiers
+    diff = ("diff --git a/src/inv.ts b/src/inv.ts\n--- a/src/inv.ts\n+++ b/src/inv.ts\n"
+            "@@ -1 +1,2 @@\n export const GHIDRA_OPS = [\n+  \"set_comment\",\n-  \"old_operation\",\n"
+            "diff --git a/src/inv.test.ts b/src/inv.test.ts\n+++ b/src/inv.test.ts\n+expect(onlyInTests_value)\n")
+    idents, paths = changed_identifiers(diff)
+    assert {"set_comment", "old_operation"} <= idents
+    assert "GHIDRA_OPS" not in idents and "onlyInTests_value" not in idents      # context line; test file
+    assert paths == ["src/inv.ts", "src/inv.test.ts"]
+
+
+def test_tests_mentioning_puts_changed_tests_first_then_specific_mentions(tmp_path, monkeypatch):
+    import macc.ownership as own
+    files = {"src/inv.test.ts": "x", "tests/ghidra/routing.test.ts": "expect(set_comment).unavailable",
+             "tests/hopper/basics.test.ts": "hopper.set_comment()", "tests/other.test.ts": "nothing",
+             "src/inv.ts": "set_comment", "docs/a.md": "set_comment"}
+    tracked = _git_repo(tmp_path / "r", files)
+    root = tmp_path / "r"
+    got = own.tests_mentioning(root, tracked, {"set_comment"}, ["src/inv.test.ts", "src/ghidra/inv.ts"])
+    assert got[0] == "src/inv.test.ts"                                    # the change's own tests
+    assert got.index("tests/ghidra/routing.test.ts") < got.index("tests/hopper/basics.test.ts")   # near the change
+    assert "tests/other.test.ts" not in got and "docs/a.md" not in got and "src/inv.ts" not in got
+    assert own.tests_mentioning(root, tracked, {"set_comment"}, [], limit=1) == ["tests/ghidra/routing.test.ts"]
+    monkeypatch.setattr(own, "MAX_TEST_HITS_PER_IDENT", 1)                # in 2 test files: too generic
+    assert own.tests_mentioning(root, tracked, {"set_comment"}, []) == []
+
+
+FOCUSED = ("sh -c 'for f; do if grep -q unavailable \"$f\"; then echo \"FAIL $f:1 still unavailable\"; exit 1; fi; "
+           "done' _ {files}")
+
+
+async def _bench_d(tmp_path, routing_text):
+    root = tmp_path / "proj"
+    _git_repo(root, {"README.md": "x\n", "tests/routing.test.txt": routing_text, "tests/unrelated.test.txt": "x\n"})
+    repo = Repo(root)
+    tasks = [Task("set_comment", "admit set_comment", owns=["src/**"], done_when=["true"]),
+             Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["set_comment"], owns=["tests/**"],
+                  max_attempts=2)]
+    return await _run(repo, tasks, focused_test_cmd=FOCUSED, integration_gates=["true"])
+
+
+async def test_integrate_runs_existing_tests_that_mention_changed_identifiers(tmp_path):
+    # bench #6404 D: a routing test still expected set_comment to be unavailable; nothing ran it
+    store, g, events, summary = await _bench_d(tmp_path, "expect(set_comment) is unavailable\n")
+    t = g.tasks["integrate"]
+    assert t.state == State.FAILED.value and "tests/routing.test.txt" in t.last_error
+    derived = [p for typ, tid, p in events if typ == "derived_tests"]
+    assert derived and derived[0]["files"] == ["tests/routing.test.txt"]     # not the unrelated test
+    assert not [1 for typ, tid, p in events if typ == "fails_outside_owns"]  # integrate owns tests/**: it may fix it
+
+
+async def test_integrate_passes_when_the_mentioning_tests_pass(tmp_path):
+    store, g, events, summary = await _bench_d(tmp_path, "expect(set_comment) is available\n")
+    assert g.tasks["integrate"].state == State.DONE.value
+    assert ("derived_tests", "integrate") in [(typ, tid) for typ, tid, p in events]
+    gates = store.latest_handoff("integrate")["gates"]
+    assert any("tests/routing.test.txt" in x["cmd"] for x in gates)
+
+
+def test_init_records_focused_test_cmd(tmp_path, capsys):
+    from macc.cli import main
+    root = tmp_path / "r"
+    _git_repo(root, {"README.md": "x\n"})
+    assert main(["--repo", str(root), "init", "--focused-test-cmd", "npm run test"]) == 2
+    assert "{files}" in capsys.readouterr().out
+    assert main(["--repo", str(root), "init", "--focused-test-cmd", "npm run test:focused -- {files}"]) == 0
+    cfg = json.loads((root / ".macc" / "config.json").read_text())
+    assert cfg["focused_test_cmd"] == "npm run test:focused -- {files}"

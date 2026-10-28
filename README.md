@@ -20,7 +20,7 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.4.0)
+## What it does today (v0.4.1)
 
 Scheduling
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other; priority by critical path.
@@ -39,7 +39,9 @@ Planning
 - **Ownership gaps (v0.4)**: identifiers the contract/code specs name (UPPER_SNAKE constants, camelCase /
   PascalCase symbols, snake_case operation names) are grepped in `scripts/`, `tests/`, `docs/` and `src/**/*.test.*`;
   files that mention them but that no task owns are listed, most likely first, with integrate as the suggested
-  owner (`macc plan PLAN.yaml --gaps` lists all). The planner prompt has the same rule.
+  owner (`macc plan PLAN.yaml --gaps` lists all). A file covered only by integrate's wildcard owns (`tests/**`)
+  and named by no spec counts as a gap too: a broad glob gives permission, not attention. The planner prompt has
+  the same rule.
 
 Gates
 - **Gate discovery**: `macc init --discover-gates` times the repo's own check/lint/format/typecheck/test targets
@@ -47,6 +49,10 @@ Gates
 - **Failures outside owns block (v0.4)**: when a `done_when` or integration gate fails and every file its output
   points at (stack frames, `file:line`, FAIL lines) is outside the task's `owns`, the task is BLOCKED at once
   (`fails_outside_owns`, with the files and a suggested owner) instead of retrying something it cannot fix.
+- **Integrate runs the tests the change touches (v0.4.1)**: with `focused_test_cmd` set (`macc init
+  --focused-test-cmd "npm run test:focused -- {files}"`), integrate also runs up to 40 existing test files that
+  mention identifiers changed since the plan's base (changed tests first, then the most specific mentions;
+  event `derived_tests`). A failure fails integrate like its own done_when.
 - **Heavy checks run once (v0.4)**: the context pack tells each worker which commands the scheduler runs for it
   (done_when, integration gates) and names the measured slow ones (>= 60 s) it must not run itself.
 - **Broken environment != broken task**: a gate that fails on the baseline blocks without charging an attempt;

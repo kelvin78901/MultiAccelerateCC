@@ -415,6 +415,20 @@ Counts by class: gate policy 3, planner 1, contract 1, attribution 0 as the endi
 (the finished run). Pattern: each release closed the hole the last run died in, and the next run died in a new one
 at the boundary between planner output and scheduler checks. macc has not finished a fan-out REA task.
 
+Two defects the last run exposed, recorded and not fixed (REA experiments ended 2026-10-28):
+
+- **v0.4.5's two mechanisms had zero effect in the real run.** `macc plan --from` hands the planner the gates
+  joined with ` && `; the planner writes that chain back as plan.yaml's `integration_gates`, and plan load lets the
+  plan's config replace config.json's list, so the scheduler ran with one entry. fast_gates (exact-string lookup in
+  measured timings) was empty and gate_broken_on_integration (exact-string membership) never matched
+  `npm run format:check`. The pre-release replay read config.json's 11 entries instead of the gate list the
+  scheduler holds after plan load, so it validated a configuration that never runs.
+- **A `merge_after` task's done_when fails by construction before its targets merge.** Since v0.2.2 a task with
+  `merge_after: [impl_X]` runs in parallel and only its merge waits; its done_when runs in its own worktree, which
+  does not contain impl_X. A tests task whose done_when runs its own new tests (the natural choice, and kept by
+  v0.4.4's derivation as exact owned files) cannot pass there. Bench 2 D v0.4.5: tests_info_plist,
+  tests_localizations and tests_privacy_manifests each failed both attempts this way.
+
 ## Later
 - Multi-model routing (cheap model for low-risk kinds).
 - Remote workers (Claude Code on the web / other machines) through the same WorkerFn interface.

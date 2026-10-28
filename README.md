@@ -1,5 +1,25 @@
 # MultiAccelerateCC
 
+## Project status: experimental, not recommended for real tasks
+
+The current version (v0.4.5) is not recommended for real work. In two benchmarks on a real repository (REA) it
+was compared with a single Claude Code session (A), background subagents (B) and an agent team (C), all on Opus
+with the same task text. Oracle = hidden acceptance cases passed; blind = independent review score out of 40.
+
+- **A single session:** #6404: finished, 749 s, $3.89, oracle 60/60, blind 31. Bench 2: finished, 1879 s, $13.53,
+  oracle 81/89, blind 32.
+- **B background subagents:** #6404: finished, 1029 s, $7.61, oracle 60/60, blind 33. Bench 2: finished, 2404 s,
+  $42.72 (over the $40 cap), oracle 81/89, blind 35.
+- **C agent team:** #6404: finished, 721 s, $6.27, oracle 58/60, blind 32. Bench 2: finished, 3751 s, $25.69,
+  oracle 82/89 with 2 broken existing tests, blind 33.
+- **D macc:** #6404: v0.4.0 finished (1543 s, $7.97, oracle 60/60, 1 regression, blind 25); v0.4.1-v0.4.3 did
+  not finish. Bench 2: v0.4.4 and v0.4.5 did not finish (2572 s / $19.84 and 3300 s / $24.13, oracle 4/89 = the
+  baseline, blind 14 and 15).
+
+Five of six macc runs failed, each at a boundary between planner output and the scheduler's checks. See
+[Negative results](docs/ROADMAP.md#negative-results-every-macc-d-run-on-rea-bench-1-and-2) and
+[Lessons](docs/ROADMAP.md#lessons) in the ROADMAP; benchmark inputs and reports are in [bench/](bench/).
+
 A deterministic task-graph scheduler that runs Claude Code workers in parallel, uses waiting
 time instead of blocking on it, and keeps the plan honest when requirements change.
 

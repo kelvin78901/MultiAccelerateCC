@@ -318,8 +318,13 @@ merged an unformatted file; four code tasks spent both attempts on format:check 
 rejected as outside its owns. Now: under per_task, integration gates measured <= `fast_gate_s` (15 s; unmeasured
 gates never) also run after every merge of any kind, and a failure reverts that merge. An integration gate that
 fails in a task's worktree and on the integration tree without its change BLOCKs the task (attempt not charged,
-event gate_broken_on_integration) naming the done tasks whose merged files the output mentions. Replay on D's
-store: 9 of 11 gates fast (17.1 s per merge), format:check among them. No live run.
+event gate_broken_on_integration) naming the done tasks whose merged files the output mentions.
+**Did not engage in the live run (bench 2 D v0.4.5).** Both checks match `integration_gates` by exact string, and the
+plan that ran had one entry: `macc plan --from` hands the planner the gates joined with ` && `, the planner writes
+that chain back into plan.yaml, and plan load replaces config.json's 11 entries with it. The chain was never
+measured, so fast_gates was empty (0 s added per merge) and `npm run format:check` was never "an integration
+gate". The pre-release replay read config.json's 11 entries, not the post-load config, and wrongly reported
+9 of 11 fast. Not fixed (bench rule: no fix after a failed D).
 
 ## Lessons
 
@@ -363,6 +368,52 @@ test files, out-of-bounds check) and a blind five-way review (8 items, max 40). 
    catches the one regression (ghidraRoutingMcp, 75 s).
 6. **The oracle saturates; the blind review and the oracle agree where they overlap** (D v0.4.3: unmapped address
    throws instead of returning false, found by both).
+
+### REA #4302+#4304+#4309 bench 2 (2026-10-28): same four arms, a task with fan-out
+$40 cap, A/B/C may continue (max 6 sessions) while any of 11 gates fails or `TASK_COMPLETE` is missing. Scored by
+`~/bench2/score.sh` (11 gates, verify:macos-bundle, verify:interface-builder, 89-case oracle, 75 related test files,
+out-of-bounds) and a blind five-way review by a new reviewer. Data: `~/bench2/REPORT.md`, `~/bench2/results/`.
+
+| arm | continues | finished | wall s | cost $ | oracle | regressions | blind (5-way) |
+|---|---|---|---|---|---|---|---|
+| A single session | 0 | yes | 1879 | 13.53 | 81/89 | 0 | 32 |
+| B background subagents | 2 | yes | 2404 | 42.72 (over cap, $5.20 est.) | 81/89 | 0 | 35 |
+| C agent team | 0 | yes | 3751 | 25.69 | 82/89 | 2 | 33 |
+| D macc v0.4.4 | - | no | 2572 | 19.84 | 4/89 | 0 | 14 |
+| D macc v0.4.5 | - | no | 3300 | 24.13 | 4/89 | 0 | 15 |
+
+1. **Fan-out did not help macc: both D runs died before integrate, on the same file.** The planner wrote a spike
+   whose output is a markdown file with done_when `test -s`; under per_task nothing else checked it, and the
+   unformatted file then failed every later task's `format:check`. The ownership rule turned the one worker that
+   fixed it into a failure.
+2. **The contract phase is a planner-made serial chain.** Both plans put spike -> contract_bundle_tools: 405 + 636 s
+   (v0.4.4) and 348 + 819 s (v0.4.5) before any code task of #4304/#4309 started. In v0.4.4 the two contracts
+   added 737 and 1595 lines (spec + schema + tests); A finished the whole task in 1879 s.
+3. **Planner-kept test commands for tests-only tasks cannot pass in a worktree.** v0.4.5 split impl_X / tests_X
+   with `merge_after: [impl_X]`; the tests tasks' done_when ran their own new tests before impl_X existed, so all
+   three failed both attempts by construction. done_when derivation kept them (exact owned files are whitelisted).
+4. **Everything macc adds is keyed to strings the planner can rewrite.** v0.4.5's two fixes compared exact gate
+   strings; the planner turned 11 gates into one chain and both fixes became no-ops.
+5. **The contract error-convention check fired in v0.4.5 (not v0.4.4) and nothing acted on it.** The exports list
+   was used (workers imported listed helpers), but no code task merged.
+6. **Blind reviewers disagree on regressions:** the 4-way reviewer named C's broken existing `inspect_plist` MCP
+   tests; the 5-way reviewer did not. Score.sh's related tests caught them in both cases.
+
+### Negative results: every macc D run on REA (bench 1 and 2)
+Six D runs, five did not finish. Class = where the defect that ended the run sits.
+
+| run | finished | where it ended | class | contributing |
+|---|---|---|---|---|
+| #6404 v0.4.0 | yes (1 regression) | ghidraRoutingMcp broke; no task owned or ran it | other (ownership coverage) | - |
+| #6404 v0.4.1 | no | planner done_when passed a directory to `test:focused` | planner | gate policy (done_when not checked) |
+| #6404 v0.4.2 | no | bridge task's done_when = verify:ghidra, needs other tasks merged | gate policy | planner |
+| #6404 v0.4.3 | no | after review REJECT, test assertion vs another task's error text in verify:ghidra; retry changed nothing | contract | attribution (retry could not fix it) |
+| bench 2 v0.4.4 | no | spike merged unformatted spike.md unchecked; every code task's format:check failed on it | gate policy | attribution (charged to the wrong tasks) |
+| bench 2 v0.4.5 | no | same spike.md; v0.4.5 checks matched no gate (planner chained the 11 gates); tests_X ran tests before impl_X merged | gate policy | attribution; other (macc fix verified on the wrong config) |
+
+Counts by class: gate policy 3, planner 1, contract 1, attribution 0 as the ending cause (3 contributing), other 1
+(the finished run). Pattern: each release closed the hole the last run died in, and the next run died in a new one
+at the boundary between planner output and scheduler checks. macc has not finished a fan-out REA task.
 
 ## Later
 - Multi-model routing (cheap model for low-risk kinds).

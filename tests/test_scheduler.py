@@ -1166,3 +1166,64 @@ async def test_worktree_setup_failure_blocks_the_task_without_charging(repo):
     assert g.tasks["a"].state == State.BLOCKED.value and g.tasks["a"].attempts == 0 and calls["n"] == 0
     assert "worktree_setup failed" in g.tasks["a"].last_error
     assert any(t == "worktree_setup_failed" and tid == "a" for t, tid, p in events)
+
+
+# ---------------------------------------------------------------- bench 2 D: a spike's file broke format:check
+FORMAT_GATE = "sh -c 'if test -f s/spike.txt; then echo \"s/spike.txt (0ms)\"; exit 1; fi'"
+
+
+def _timed(repo, cmd, seconds):
+    import json
+    repo.macc_dir.mkdir(parents=True, exist_ok=True)
+    (repo.macc_dir / "gate_discovery.json").write_text(json.dumps({"timed": [{"cmd": cmd, "seconds": seconds,
+                                                                              "ok": True}]}))
+
+
+async def test_fast_integration_gate_runs_after_a_spike_merge_and_reverts_it(repo):
+    # the spike's own done_when (`test -s`) passes; the measured-fast integration gate does not: not merged
+    _timed(repo, FORMAT_GATE, 0.5)
+    tasks = [Task("spike", "spike", kind=Kind.SPIKE.value, owns=["s/**"], max_attempts=1,
+                  spec="mock:write=s/spike.txt", done_when=["test -s s/spike.txt"]),
+             Task("c", "c", deps=["spike"], owns=["c/**"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=[FORMAT_GATE])
+    assert g.tasks["spike"].state == State.FAILED.value
+    assert "integration gate failed after merge" in g.tasks["spike"].last_error
+    assert not (repo.integration_path / "s" / "spike.txt").exists()
+    assert "c" not in worker.calls
+
+
+async def test_slow_or_unmeasured_gates_do_not_run_per_merge(repo):
+    _timed(repo, FORMAT_GATE, 120.0)
+    tasks = [Task("spike", "spike", kind=Kind.SPIKE.value, owns=["s/**"], spec="mock:write=s/spike.txt",
+                  done_when=["test -s s/spike.txt"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=[FORMAT_GATE, "echo unmeasured"])
+    assert s.fast_gates == [] and g.tasks["spike"].state == State.DONE.value
+
+
+async def test_gate_broken_on_integration_blocks_and_names_the_merging_task(repo):
+    # fast gates off: the spike's file reaches integration; c's own copy of the gate then fails on a file c does
+    # not own. Before: c spent both attempts on it. Now: BLOCKED, attempt not charged, the spike named.
+    tasks = [Task("spike", "spike", kind=Kind.SPIKE.value, owns=["s/**"], spec="mock:write=s/spike.txt",
+                  done_when=["test -s s/spike.txt"]),
+             Task("c", "c", deps=["spike"], owns=["c/**"], max_attempts=2, done_when=[FORMAT_GATE])]
+    evs = []
+    store = Store(repo.macc_dir / "state.db")
+    g = TaskGraph(tasks); g.validate()
+    worker = MockWorker()
+    s = Scheduler(repo, store, g, worker, SchedulerConfig(integration_gates=[FORMAT_GATE], fast_gate_s=0),
+                  on_event=lambda t, tid, p: evs.append((t, tid, p)))
+    await s.run()
+    c = g.tasks["c"]
+    assert c.state == State.BLOCKED.value and c.attempts == 0 and worker.calls.count("c") == 1
+    ev = next(p for t, tid, p in evs if t == "gate_broken_on_integration")
+    assert ev["files"] == ["s/spike.txt"] and ev["culprits"] == ["spike"]
+    assert "merged by ['spike']" in c.last_error
+    assert not any(t == "retry" and tid == "c" for t, tid, p in evs)
+
+
+async def test_own_done_when_failing_is_still_the_tasks_failure(repo):
+    # a check that is not an integration gate is never attributed to the integration tree
+    tasks = [Task("c", "c", owns=["c/**"], max_attempts=1, done_when=["false"])]
+    s, store, g, worker, events, summary = await run(repo, tasks, integration_gates=["true"])
+    assert g.tasks["c"].state == State.FAILED.value
+    assert ("gate_broken_on_integration", "c") not in events

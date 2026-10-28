@@ -157,7 +157,11 @@ tasks:
 Gates: with `gate_policy: per_task` (default) a merge runs only that task's `done_when` on the
 integration tree (skipped when the tree is identical to the one it passed on in the worktree); the full
 `integration_gates` run after `integrate` merges and once at the end of the run (`final_gate_failed` if
-that fails; nothing is rolled back). `gate_policy: full` runs the full suite after every merge.
+that fails; nothing is rolled back). Integration gates measured at most `fast_gate_s` seconds (default 15;
+from `init --discover-gates` or earlier runs; unmeasured gates are not used) also run after every merge, so no
+task of any kind (a spike, a contract) merges a tree that fails them. A task whose integration gate also fails on
+the integration tree without its change is BLOCKED, not retried, naming the task that merged the files the
+output mentions. `gate_policy: full` runs the full suite after every merge.
 
 Never hard-code a commit hash in a spec or `done_when`: the base moves. Every worker and gate gets
 `MACC_BASE` (merge-base of `macc/integration` and the mainline) and `MACC_INTEGRATION` (integration

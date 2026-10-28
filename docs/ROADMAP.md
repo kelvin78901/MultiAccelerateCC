@@ -312,6 +312,15 @@ plans, each missing error message wording, the v0.4.3 failure); nearby exports i
 (`~/bench/replay_v044.py`): verify:ghidra moved off the worker task in D v0.4.2 and v0.4.3; ghidraRoutingMcp.test.ts
 covered by integrate's derived done_when in D v0.4.0. No live run.
 
+## v0.4.5 — no merge leaves integration failing a fast gate (done)
+Bench 2 (REA #4302+#4304+#4309) D v0.4.4 failed in parallel code: a spike (done_when `test -s spike.md`, per_task)
+merged an unformatted file; four code tasks spent both attempts on format:check of it and apple_docs' fix was
+rejected as outside its owns. Now: under per_task, integration gates measured <= `fast_gate_s` (15 s; unmeasured
+gates never) also run after every merge of any kind, and a failure reverts that merge. An integration gate that
+fails in a task's worktree and on the integration tree without its change BLOCKs the task (attempt not charged,
+event gate_broken_on_integration) naming the done tasks whose merged files the output mentions. Replay on D's
+store: 9 of 11 gates fast (17.1 s per merge), format:check among them. No live run.
+
 ## Lessons
 
 ### REA #6404 bench (2026-10-27): single session vs subagents vs agent team vs macc

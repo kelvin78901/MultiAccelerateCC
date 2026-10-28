@@ -61,6 +61,10 @@ class SchedulerConfig:
     review_low_model: str = "sonnet"
     review_low_effort: str = "medium"
     strict_ownership: bool = True                # out-of-scope changes fail the attempt (else: dropped + warned)
+    # per_task: integration gates measured at most this many seconds also run after every merge, whatever the
+    # task's kind (bench 2 D: a spike whose done_when was `test -s spike.md` merged an unformatted file and every
+    # later task's format:check failed on it). Unmeasured gates are not run. 0: off.
+    fast_gate_s: float = 15.0
     cost_baseline_usd: float = 0.0               # store total at plan load; budget applies to cost since then
 
     def __post_init__(self) -> None:
@@ -107,6 +111,9 @@ class Scheduler:
         if hasattr(worker, "env_provider"):
             worker.env_provider = self.repo.macc_env
         self.stopped_reason: Optional[str] = None
+        secs = store.command_seconds() if self.cfg.fast_gate_s > 0 else {}
+        self.fast_gates = [c for c in self.cfg.integration_gates
+                           if c in secs and secs[c] <= self.cfg.fast_gate_s]
 
     # ------------------------------------------------------------ plumbing
     def emit(self, type_: str, task_id: Optional[str] = None, **payload) -> None:
@@ -495,7 +502,7 @@ class Scheduler:
             self.serial_seconds += sum(g.get("seconds", 0.0) for g in gates if not g.get("shared"))
         if gates and not all(g["ok"] for g in gates):
             bad = next(g for g in gates if not g["ok"])
-            if self._blocked_outside_owns(t, bad, wt):
+            if self._broken_on_integration(t, bad) or self._blocked_outside_owns(t, bad, wt):
                 self._cleanup(tid)
                 return
             self._fail(t, f"gate failed: {bad['cmd']}\n{clip_output(bad['stderr'], 700, 1500)}\n{clip_output(bad['stdout'], 700, 1500)}")
@@ -594,6 +601,8 @@ class Scheduler:
                 # the rebase was a no-op: integration now holds exactly the tree the task's gates passed on
                 self.emit("gate_reused", tid, cmds=cmds)
                 cmds = []
+            if not full:
+                cmds += [c for c in self.fast_gates if c not in t.done_when]
             igates = await asyncio.to_thread(self.repo.run_gates, cmds) if cmds else []
             self._record_gates(tid, igates, full)
             if igates and not all(g["ok"] for g in igates):
@@ -601,6 +610,9 @@ class Scheduler:
                 bad = next(g for g in igates if not g["ok"])
                 # Was the baseline already broken? Then this is an environment problem, not the task's.
                 # (Only meaningful for the shared suite: a task's own done_when fails on a tree without it.)
+                if not full and self._broken_on_integration(t, bad):   # broken before this merge: name who
+                    self._cleanup(tid)
+                    return
                 baseline = self.repo.run_gates([bad["cmd"]]) if full else [{"ok": True}]
                 if not baseline[0]["ok"]:
                     t.attempts = max(0, t.attempts - 1)       # do not charge the attempt
@@ -828,6 +840,35 @@ class Scheduler:
         if t.id in self._serial_points:
             self.serial_seconds += sum(r.get("seconds", 0.0) for r in recs)
         return recs
+
+    def _broken_on_integration(self, t: Task, bad: dict) -> bool:
+        """An integration gate that fails in the task's worktree and on the integration tree without the task's
+        change is not the task's to fix: a retry fails the same way (bench 2 D: four tasks spent both attempts on
+        format:check of a spike's file; apple_docs' fix of it was rejected as outside its owns). BLOCK it, do not
+        charge the attempt, and name the done tasks whose merged files the failure output mentions."""
+        if bad["cmd"] not in self.cfg.integration_gates:
+            return False                                   # a task's own check fails on a tree without the task
+        if self.repo.run_gates([bad["cmd"]])[0]["ok"]:
+            return False
+        from .ownership import _owned
+        out = f"{bad.get('stderr', '')}\n{bad.get('stdout', '')}"
+        base = self.cfg.plan_base or self.repo.macc_env().get("MACC_BASE")
+        changed = self.repo.git("diff", "--name-only", f"{base}..HEAD", cwd=self.repo.integration_path,
+                                check=False).stdout.split() if base else []
+        files = [f for f in changed if f in out]
+        culprits = [x.id for x in self.graph.tasks.values() if x.id != t.id and x.state == State.DONE.value
+                    and any(_owned(f, x.owns) for f in files)]
+        t.attempts = max(0, t.attempts - 1)
+        t.state = State.BLOCKED.value
+        who = (f"; it points at {files[:10]}, merged by {culprits}" if culprits else
+               f"; it points at {files[:10]}" if files else "")
+        t.last_error = (f"integration gate '{bad['cmd']}' fails on the integration tree without {t.id}'s change"
+                        f"{who}. Fix it there (`macc change <task> --spec ...` or by hand on the integration "
+                        f"branch), then `macc retry {t.id}`.\n"
+                        f"{clip_output(bad.get('stderr', ''), 400, 800)}{clip_output(bad.get('stdout', ''), 400, 800)}")
+        self._persist(t.id)
+        self.emit("gate_broken_on_integration", t.id, cmd=bad["cmd"], files=files[:20], culprits=culprits)
+        return True
 
     def _blocked_outside_owns(self, t: Task, bad: dict, where) -> bool:
         """A gate whose failure output points only at files the task does not own cannot be fixed by a retry

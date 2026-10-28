@@ -181,9 +181,41 @@ def failure_files(output: str, tracked: set[str]) -> list[str]:
     return found
 
 
+_FRAME = re.compile(r"^\s*at\s")
+
+
+def throw_sites(output: str, tracked: set[str]) -> list[str]:
+    """Where the failures were raised, not who called: every non-frame location (a `file:line` header, a compiler
+    error, a FAIL line) plus, for each stack trace, only its first frame in a tracked file. Callers further down a
+    stack are not failure sites (bench #6404 D v0.4.2: the verifier threw in an unowned script; the task owned the
+    script that called it, and that caller frame made the task retry a failure it could not fix)."""
+    found: list[str] = []
+    in_stack = taken = False
+    for line in _ANSI.sub("", output).splitlines():
+        frame = bool(_FRAME.match(line))
+        if not frame:
+            in_stack = taken = False
+        elif not in_stack:
+            in_stack, taken = True, False
+        if frame and taken:
+            continue
+        for rx in _LOCUS:
+            for m in rx.finditer(line):
+                f = _to_tracked(m.group(1), tracked)
+                if f:
+                    if frame:
+                        taken = True
+                    if f not in found:
+                        found.append(f)
+            if frame and taken:
+                break
+    return found
+
+
 def outside_owns(output: str, tracked: set[str], owns: list[str]) -> list[str]:
-    """The failure files when ALL of them are outside `owns` (a retry cannot fix them), else []."""
-    files = failure_files(output, tracked)
+    """The throw sites when ALL of them are outside `owns` (a retry cannot fix them), else []. Trade-off: a task
+    that passes bad input into an unowned library is blocked too; BLOCKED is recoverable with `macc retry`."""
+    files = throw_sites(output, tracked)
     if files and not any(_owned(f, owns) for f in files):
         return files
     return []

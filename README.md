@@ -20,7 +20,7 @@ for a test run is ten minutes of nothing. Official parallel features (subagents,
 dynamic workflows) still make the *model* the scheduler, which costs tokens and loses track of
 state. macc moves scheduling into a plain program and calls the model only to do work.
 
-## What it does today (v0.4.2)
+## What it does today (v0.4.3)
 
 Scheduling
 - **Parallel fan-out** with a WIP limit; independent tasks never wait for each other; priority by critical path.
@@ -37,6 +37,8 @@ Planning
   validates it (cycles, contract limits, ownership overlap, missing done_when, impossible guards, review asking
   for the full suite) and you review the file before `macc plan PLAN.yaml`. The planner sees `.macc/rules.md` as
   well as AGENTS.md / CONTRIBUTING.md / CLAUDE.md, so its done_when commands follow the same rules as workers (v0.4.2).
+  A code/contract task whose done_when repeats an end-to-end command integrate also runs (naming none of the task's
+  files, measured >= 60 s or unmeasured) is warned about: it can fail alone until the other tasks merge (v0.4.3).
 - **Ownership gaps (v0.4)**: identifiers the contract/code specs name (UPPER_SNAKE constants, camelCase /
   PascalCase symbols, snake_case operation names) are grepped in `scripts/`, `tests/`, `docs/` and `src/**/*.test.*`;
   files that mention them but that no task owns are listed, most likely first, with integrate as the suggested
@@ -48,7 +50,8 @@ Gates
 - **Gate discovery**: `macc init --discover-gates` times the repo's own check/lint/format/typecheck/test targets
   on the integration tree; `--pick` adds chosen ones to `integration_gates` (details below).
 - **Failures outside owns block (v0.4)**: when a `done_when` or integration gate fails and every file its output
-  points at (stack frames, `file:line`, FAIL lines) is outside the task's `owns`, the task is BLOCKED at once
+  was raised at (`file:line` headers, compiler errors, FAIL lines, and the first tracked frame of each stack;
+  callers further down a stack do not count, v0.4.3) is outside the task's `owns`, the task is BLOCKED at once
   (`fails_outside_owns`, with the files and a suggested owner) instead of retrying something it cannot fix.
 - **Integrate runs the tests the change touches (v0.4.1)**: with `focused_test_cmd` set (`macc init
   --focused-test-cmd "npm run test:focused -- {files}"`), integrate also runs up to 40 existing test files that

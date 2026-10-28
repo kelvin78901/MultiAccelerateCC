@@ -196,6 +196,37 @@ def plan_warnings(g: TaskGraph, existing_files: set[str] | None = None, gates: l
     return warns
 
 
+HEAVY_E2E_S = 60.0
+
+
+def end_to_end_gates(g: TaskGraph, gates: list[str] | None = None,
+                     command_s: Optional[dict] = None) -> list[str]:
+    """A non-integrate task whose done_when repeats a command integrate also runs, naming none of the task's own
+    files, is running an end-to-end check alone in its worktree: it fails there until the other tasks merge
+    (bench #6404 D v0.4.2: the bridge task's `npm run verify:ghidra` failed twice in a verifier it did not own)."""
+    integ = {c.strip() for t in g.tasks.values() if t.kind == Kind.INTEGRATE.value for c in t.done_when}
+    shared = {c.strip() for c in (gates or [])}
+    out = []
+    for t in g.tasks.values():
+        if t.kind not in (Kind.CODE.value, Kind.CONTRACT.value):
+            continue
+        for c in t.done_when:
+            cmd = c.strip()
+            if cmd not in integ or cmd in shared:
+                continue
+            words = [w.strip("'\"") for w in cmd.split()]
+            if any(_glob_hit(w, o) for w in words for o in t.owns if "/" in w or "." in w):
+                continue
+            secs = (command_s or {}).get(cmd)
+            if secs is not None and secs < HEAVY_E2E_S:
+                continue                          # measured quick (REA bridge-sources: 1.7 s compile of own files)
+            timing = f"measured {secs:.0f} s" if secs is not None else "no timing recorded; ignore if it is quick and targeted"
+            out.append(f"{t.id}: done_when runs {cmd!r} ({timing}), which integrate also runs and which names none of "
+                       f"{t.id}'s files: an end-to-end check that can fail in this task's worktree until the other tasks "
+                       "merge. Give the task a targeted check and leave this one to integrate")
+    return out
+
+
 def _glob_hit(path: str, glob: str) -> bool:
     import fnmatch
     if fnmatch.fnmatch(path, glob):
@@ -372,7 +403,8 @@ class PlanResult:
 async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: Path,
                         effort: str = "high", model: Optional[str] = None, max_rounds: int = 2,
                         existing_files: Optional[list[str]] = None, current_gate: str = "",
-                        history: Optional[dict] = None, project_rules: str = "") -> PlanResult:
+                        history: Optional[dict] = None, project_rules: str = "",
+                        command_s: Optional[dict] = None) -> PlanResult:
     """Call the planner worker inside `workdir` (the integration worktree, where workers will run);
     on validation failure feed the error back once. Returns the graph plus non-fatal warnings."""
     files = existing_files if existing_files is not None else sorted(
@@ -405,6 +437,7 @@ async def generate_plan(description: str, workdir: Path, worker: WorkerFn, out: 
         out.write_text(text + "\n")
         cfg = (data.get("config") or {}) if isinstance(data, dict) else {}
         warns = plan_warnings(g, set(files), cfg.get("integration_gates"))
+        warns += end_to_end_gates(g, cfg.get("integration_gates"), command_s)
         from .ownership import gap_warnings, ownership_gaps
         warns += gap_warnings(ownership_gaps(g, workdir, files))
         return PlanResult(graph=g, warnings=warns, config=cfg, usage=usage)

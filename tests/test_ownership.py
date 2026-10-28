@@ -328,3 +328,80 @@ def test_init_records_focused_test_cmd(tmp_path, capsys):
     assert main(["--repo", str(root), "init", "--focused-test-cmd", "npm run test:focused -- {files}"]) == 0
     cfg = json.loads((root / ".macc" / "config.json").read_text())
     assert cfg["focused_test_cmd"] == "npm run test:focused -- {files}"
+
+
+# ------------------------------------------------------------------ v0.4.3: throw sites, end-to-end gates
+NODE_UNCAUGHT = (  # the shape of bench #6404 D v0.4.2's verify:ghidra failure
+    "file:///w/.macc/worktrees/bridge/scripts/verify-inventory.mjs:43\n    throw new Error(\n          ^\n\n"
+    "Error: Ghidra set_comment rejection drifted: {...}\n"
+    "    at expectRemoteFailure (file:///w/.macc/worktrees/bridge/scripts/verify-inventory.mjs:43:11)\n"
+    "    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n"
+    "    at async verifyTarget (file:///w/.macc/worktrees/bridge/scripts/run-turbo.mjs:574:17)\n"
+    "    at async file:///w/.macc/worktrees/bridge/src/a.ts:284:17\n")
+
+
+def test_throw_sites_skip_caller_frames():
+    from macc.ownership import throw_sites
+    assert throw_sites(NODE_UNCAUGHT, TRACKED) == ["scripts/verify-inventory.mjs"]
+    # a stack whose first frames are untracked (node internals, dist/) takes its first tracked frame
+    stack = "Error: x\n    at a (node:internal/x:1:1)\n    at b (/t/dist/cli/x.js:9:1)\n    at c (/w/src/a.ts:3:1)\n" \
+            "    at d (/w/scripts/run-turbo.mjs:1:1)\n"
+    assert throw_sites(stack, TRACKED) == ["src/a.ts"]
+    # separate stacks each have their own site; non-frame locations always count
+    assert throw_sites(stack + "src/a.test.ts:4 failed\nError: y\n    at e (/w/.github/x.yml:1:1)\n", TRACKED) == \
+        ["src/a.ts", "src/a.test.ts", ".github/x.yml"]
+
+
+def test_outside_owns_ignores_owned_caller_frames_but_not_owned_sites():
+    owns = ["src/**", "scripts/run-turbo.mjs"]                     # the task owns the callers, not the thrower
+    assert outside_owns(NODE_UNCAUGHT, TRACKED, owns) == ["scripts/verify-inventory.mjs"]
+    assert outside_owns(NODE_UNCAUGHT + "src/a.ts:9: error TS2322\n", TRACKED, owns) == []   # its own site too
+
+
+CALLER_OWNED = ("echo '    at check (file://'\"$PWD\"'/scripts/verify.mjs:1:7)' >&2; "
+                "echo '    at main (file://'\"$PWD\"'/README.md:9:1)' >&2; exit 1")   # a tracked file the task owns
+
+
+async def test_failure_thrown_outside_owns_blocks_even_with_an_owned_caller(repo):
+    tasks = [Task("g", "g", owns=["x/**", "README.md"], done_when=[CALLER_OWNED], max_attempts=2),
+             Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["g"], owns=["x/**"])]
+    store, g, events, summary = await _run(repo, tasks)
+    assert g.tasks["g"].state == State.BLOCKED.value and g.tasks["g"].attempts == 1
+    assert [p["files"] for typ, tid, p in events if typ == "fails_outside_owns"] == [["scripts/verify.mjs"]]
+
+
+def _e2e_plan(bridge_done_when):
+    return TaskGraph([
+        Task("bridge", "b", owns=["bridge/**", "scripts/verify-real.mjs"], done_when=bridge_done_when),
+        Task("integrate", "i", kind=Kind.INTEGRATE.value, deps=["bridge"], owns=["src/**"],
+             done_when=["npm run verify:ghidra", "npm run verify:bridge-sources", "npm run check:fast",
+                        "npm run test:focused -- scripts/verify-real.mjs"]),
+    ])
+
+
+def test_end_to_end_gate_on_a_worker_task_is_warned():
+    from macc.planner import end_to_end_gates
+    g = _e2e_plan(["npm run verify:ghidra", "npm run verify:bridge-sources", "npm run check:fast",
+                   "npm run test:focused -- scripts/verify-real.mjs"])
+    secs = {"npm run verify:ghidra": 260.0, "npm run verify:bridge-sources": 1.7}
+    warns = end_to_end_gates(g, ["npm run check:fast"], secs)
+    assert len(warns) == 1 and "bridge: done_when runs 'npm run verify:ghidra' (measured 260 s)" in warns[0]
+    # measured quick (own compile check), an integration gate, and a check naming the task's own file: no warning
+    unmeasured = end_to_end_gates(g, ["npm run check:fast"], {"npm run verify:ghidra": 260.0})
+    assert len(unmeasured) == 2 and "no timing recorded" in unmeasured[1]
+    assert end_to_end_gates(_e2e_plan(["npm run verify:ghidra"]), [], {"npm run verify:ghidra": 30.0}) == []
+
+
+def test_plan_load_prints_the_end_to_end_warning(tmp_path, capsys):
+    from macc.cli import main
+    root = tmp_path / "r"
+    _git_repo(root, {"README.md": "x\n"})
+    assert main(["--repo", str(root), "init"]) == 0
+    (root / ".macc" / "gate_discovery.json").write_text(json.dumps({"timed": [
+        {"cmd": "npm run verify:ghidra", "seconds": 260.0, "ok": True}]}))
+    plan = tmp_path / "p.yaml"
+    plan.write_text(json.dumps({"tasks": [
+        {"id": t.id, "title": t.title, "kind": t.kind, "deps": t.deps, "owns": t.owns, "done_when": t.done_when}
+        for t in _e2e_plan(["npm run verify:ghidra"]).tasks.values()]}))
+    assert main(["--repo", str(root), "plan", str(plan)]) == 0
+    assert "WARNING: bridge: done_when runs 'npm run verify:ghidra' (measured 260 s)" in capsys.readouterr().out

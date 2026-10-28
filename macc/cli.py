@@ -184,7 +184,8 @@ def cmd_plan(a) -> int:
         repo.gate_timeout = int(cfg_now.get("gate_timeout", 1800))
         pr = asyncio.run(generate_plan(a.from_desc, ipath, worker, out, effort=a.effort, model=a.model,
                                        existing_files=existing, current_gate=gate_now,
-                                       history=store.history_by_kind(), project_rules=_rules(repo)))
+                                       history=store.history_by_kind(), project_rules=_rules(repo),
+                                       command_s=store.command_seconds()))
         g = pr.graph
         for i, u in enumerate(pr.usage, 1):
             store.add_usage("_plan", i, getattr(worker, "name", "worker"), u.ok, model=u.model,
@@ -259,6 +260,9 @@ def cmd_plan(a) -> int:
     cfg["plan_base"] = repo.head(repo.ensure_integration())       # reviews tier on this plan's change
     (repo.macc_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     print(f"loaded {len(g.tasks)} tasks; ready now: {[t.id for t in g.ready()]}")
+    from .planner import end_to_end_gates
+    for w in end_to_end_gates(g, cfg.get("integration_gates"), store.command_seconds()):
+        print(f"WARNING: {w}")
     from .ownership import gap_warnings, ownership_gaps
     ipath = repo.ensure_integration()
     gaps = ownership_gaps(g, ipath, repo.git("ls-files", cwd=ipath).stdout.split())
